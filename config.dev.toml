@@ -1,0 +1,22 @@
+# Development configuration. Everything lives under the repo so a dev run never
+# touches /var and never needs root.
+
+[runtime]
+state_dir = "./.vanguard"
+socket    = "./.vanguard/vanguard.sock"
+log_level = "debug"
+
+[limits]
+max_steps               = 50
+max_consecutive_rejects = 3
+state_timeout_ms        = 30000
+max_payload_bytes       = 65536
+max_context_tokens      = 8192
+
+[sandbox]
+fuel            = 10000000
+max_memory_mb   = 64
+wall_timeout_ms = 50
+
+[egress]
+allow = []
