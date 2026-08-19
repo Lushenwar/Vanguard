@@ -11,5 +11,6 @@ pub mod error;
 pub mod fsm;
 pub mod ledger;
 pub mod runtime;
+pub mod sandbox;
 
 pub use error::{Error, Result};

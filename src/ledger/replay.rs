@@ -7,7 +7,7 @@
 //! and an edge table that has been changed since the log was written, which
 //! would silently invalidate every historical audit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::Result;
 use crate::fsm::engine::{self, Decision, Limits, SessionView};
@@ -44,7 +44,17 @@ impl ReplaySummary {
 }
 
 /// Replay `session_id` (or the whole ledger when `None`).
-pub fn replay(ledger: &Ledger, session_id: Option<&str>, limits: &Limits) -> Result<ReplaySummary> {
+///
+/// `tools` must be the tool set that was registered when the log was written.
+/// Replaying against a different set is not a bug in this function — it is the
+/// divergence it exists to report, because a tool appearing or disappearing
+/// changes which proposals the engine would have authorized.
+pub fn replay(
+    ledger: &Ledger,
+    session_id: Option<&str>,
+    limits: &Limits,
+    tools: &BTreeSet<String>,
+) -> Result<ReplaySummary> {
     let events = ledger.events(session_id)?;
 
     let mut sessions: BTreeMap<String, SessionView> = BTreeMap::new();
@@ -64,7 +74,7 @@ pub fn replay(ledger: &Ledger, session_id: Option<&str>, limits: &Limits) -> Res
             });
         }
 
-        let decision = engine::evaluate(before, limits, rec.event, rec.origin, &rec.payload);
+        let decision = engine::evaluate(before, limits, rec.event, rec.origin, &rec.payload, tools);
         let recorded_status = rec.status;
         let replayed_status = match decision {
             Decision::Accept { .. } => Status::Accepted,
@@ -109,12 +119,39 @@ mod tests {
     use crate::clock::Clock;
     use crate::fsm::state::{Event, Origin};
     use crate::runtime::Runtime;
+    use crate::sandbox::{Fuel, Sandbox, ToolRegistry};
+
+    const ECHO_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (global $next (mut i32) (i32.const 1024))
+          (func (export "alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $next))
+            (global.set $next (i32.add (global.get $next) (local.get $n)))
+            (local.get $p))
+          (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+            (i64.or
+              (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+              (i64.extend_i32_u (local.get $len)))))
+    "#;
+
+    fn registry() -> ToolRegistry {
+        let mut r = ToolRegistry::new(Sandbox::new(Fuel::default()).unwrap());
+        r.insert("echo", ECHO_WAT.as_bytes()).unwrap();
+        r
+    }
+
+    fn echo_only() -> BTreeSet<String> {
+        ["echo".to_string()].into_iter().collect()
+    }
 
     fn recorded_run() -> Runtime {
         let mut rt = Runtime::new(
             Ledger::open_in_memory([3u8; 32]).unwrap(),
             Limits::default(),
             Clock::new(),
+            registry(),
         );
         rt.open_session("a").unwrap();
         rt.open_session("b").unwrap();
@@ -122,6 +159,9 @@ mod tests {
             .unwrap();
         rt.submit("b", Event::Start, Origin::Proposer, b"{}")
             .unwrap();
+        // Runs the tool and appends its TOOL_RESULT, interleaved with another
+        // session so replay has to keep per-session state rather than one
+        // global cursor.
         rt.submit(
             "a",
             Event::ExecuteTool,
@@ -129,12 +169,8 @@ mod tests {
             br#"{"tool_name":"echo"}"#,
         )
         .unwrap();
-        // Illegal from PLANNING, and interleaved with another session so the
-        // replay has to keep per-session state rather than one global cursor.
         rt.submit("b", Event::ToolResult, Origin::Runtime, b"{}")
-            .unwrap();
-        rt.submit("a", Event::ToolResult, Origin::Runtime, b"{}")
-            .unwrap();
+            .unwrap(); // illegal from PLANNING
         rt.submit("a", Event::Finish, Origin::Proposer, b"{}")
             .unwrap();
         rt
@@ -143,7 +179,7 @@ mod tests {
     #[test]
     fn replay_reproduces_recorded_states() {
         let rt = recorded_run();
-        let summary = replay(rt.ledger(), None, &Limits::default()).unwrap();
+        let summary = replay(rt.ledger(), None, &Limits::default(), &echo_only()).unwrap();
         assert!(
             summary.is_faithful(),
             "mismatches: {:?}",
@@ -156,30 +192,44 @@ mod tests {
     #[test]
     fn replay_is_byte_identical_across_runs() {
         let rt = recorded_run();
-        let a = replay(rt.ledger(), None, &Limits::default()).unwrap();
-        let b = replay(rt.ledger(), None, &Limits::default()).unwrap();
+        let a = replay(rt.ledger(), None, &Limits::default(), &echo_only()).unwrap();
+        let b = replay(rt.ledger(), None, &Limits::default(), &echo_only()).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn per_session_replay_sees_only_that_session() {
         let rt = recorded_run();
-        let summary = replay(rt.ledger(), Some("b"), &Limits::default()).unwrap();
+        let summary = replay(rt.ledger(), Some("b"), &Limits::default(), &echo_only()).unwrap();
         assert!(summary.is_faithful(), "{:?}", summary.mismatches);
         assert_eq!(summary.sessions.len(), 1);
     }
 
     #[test]
-    fn a_changed_edge_table_shows_up_as_a_mismatch() {
-        // Simulated by replaying with a budget tighter than the one in force
-        // when the log was written: the engine now rejects what it once
-        // accepted, which is precisely the class of drift this catches.
+    fn a_tighter_budget_shows_up_as_a_mismatch() {
+        // Replaying with a budget tighter than the one in force when the log
+        // was written: the engine now rejects what it once accepted, which is
+        // precisely the class of drift this catches.
         let rt = recorded_run();
         let tight = Limits {
             max_steps: 1,
             ..Limits::default()
         };
-        let summary = replay(rt.ledger(), None, &tight).unwrap();
+        let summary = replay(rt.ledger(), None, &tight, &echo_only()).unwrap();
         assert!(!summary.is_faithful());
+    }
+
+    #[test]
+    fn a_removed_tool_shows_up_as_a_mismatch() {
+        // The audit-relevant case: a tool that existed when the session ran has
+        // since been withdrawn. The log says the call was authorized; today's
+        // registry says it would not be. Replay must not paper over that.
+        let rt = recorded_run();
+        let summary = replay(rt.ledger(), None, &Limits::default(), &BTreeSet::new()).unwrap();
+        assert!(!summary.is_faithful());
+        assert!(summary
+            .mismatches
+            .iter()
+            .any(|m| m.recorded == "ACCEPTED" && m.expected == "REJECTED"));
     }
 }

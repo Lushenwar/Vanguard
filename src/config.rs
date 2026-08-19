@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::fsm::engine::Limits;
+use crate::sandbox::Fuel;
 
 pub const APP_NAME: &str = "vanguard";
 pub const LEDGER_FILE: &str = "vanguard.sqlite";
+pub const TOOLS_DIR: &str = "tools";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 // `deny_unknown_fields` turns a mistyped key into a startup failure instead of
@@ -109,6 +111,21 @@ impl Config {
 
     pub fn ledger_path(&self) -> PathBuf {
         self.runtime.state_dir.join(LEDGER_FILE)
+    }
+
+    /// Where compiled tool modules live. Derived from `state_dir` rather than
+    /// given its own key: a second path to configure is a second path to get
+    /// wrong, and nothing yet wants them apart.
+    pub fn tools_dir(&self) -> PathBuf {
+        self.runtime.state_dir.join(TOOLS_DIR)
+    }
+
+    /// The resource ceiling handed to every tool call.
+    pub fn sandbox_fuel(&self) -> Fuel {
+        Fuel {
+            units: self.sandbox.fuel,
+            max_memory_bytes: (self.sandbox.max_memory_mb as usize) * 1024 * 1024,
+        }
     }
 
     /// The subset of configuration the FSM evaluator is allowed to see.

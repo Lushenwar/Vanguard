@@ -1,6 +1,10 @@
 //! Phase 0 exit tests: the ledger survives restart and detects tampering.
 
+mod common;
+
 use std::path::{Path, PathBuf};
+
+use common::echo_registry;
 
 use vanguard::clock::Clock;
 use vanguard::fsm::engine::Limits;
@@ -17,7 +21,7 @@ fn ledger_path(dir: &tempfile::TempDir) -> PathBuf {
 /// Drive a session through a full accept/reject/tool-result cycle.
 fn write_events(path: &Path, session: &str) -> u64 {
     let ledger = Ledger::open(path, KEY).unwrap();
-    let mut rt = Runtime::new(ledger, Limits::default(), Clock::new());
+    let mut rt = Runtime::new(ledger, Limits::default(), Clock::new(), echo_registry());
     rt.open_session(session).unwrap();
     rt.submit(session, Event::Start, Origin::Proposer, b"{}")
         .unwrap();
@@ -25,19 +29,12 @@ fn write_events(path: &Path, session: &str) -> u64 {
         session,
         Event::ExecuteTool,
         Origin::Proposer,
-        br#"{"tool_name":"fetch_http"}"#,
+        br#"{"tool_name":"echo"}"#,
     )
-    .unwrap();
-    // Illegal from TOOL_EXECUTION: recorded, does not move state.
-    rt.submit(session, Event::Finish, Origin::Proposer, b"{}")
+    .unwrap(); // runs the tool and appends its TOOL_RESULT
+               // Illegal from REFLECTING: recorded, does not move state.
+    rt.submit(session, Event::Start, Origin::Proposer, b"{}")
         .unwrap();
-    rt.submit(
-        session,
-        Event::ToolResult,
-        Origin::Runtime,
-        br#"{"ok":true}"#,
-    )
-    .unwrap();
     rt.ledger().head().0
 }
 
@@ -57,7 +54,7 @@ fn ledger_chain_survives_restart() {
     assert_eq!(reopened.head().1, v.head_hash);
 
     // And the chain continues correctly across the restart boundary.
-    let mut rt = Runtime::new(reopened, Limits::default(), Clock::new());
+    let mut rt = Runtime::new(reopened, Limits::default(), Clock::new(), echo_registry());
     rt.submit("s1", Event::Finish, Origin::Proposer, b"{}")
         .unwrap();
     assert_eq!(rt.session("s1").unwrap().state, State::Done);

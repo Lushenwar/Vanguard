@@ -18,6 +18,7 @@ use vanguard::fsm::state::{Event, Origin};
 use vanguard::ledger::event::hex;
 use vanguard::ledger::{key, replay, Ledger};
 use vanguard::runtime::Runtime;
+use vanguard::sandbox::{Sandbox, ToolRegistry};
 
 /// Exit codes, as documented in CLAUDE.md.
 mod code {
@@ -109,6 +110,16 @@ fn run(args: Args) -> vanguard::Result<u8> {
             let (seq, hash) = ledger.head();
             println!("ledger  {}", db_path.display());
             println!("head    seq={seq} hash={}", hex(&hash));
+            let registry = tools(&config)?;
+            println!(
+                "tools   {} registered: {}",
+                registry.len(),
+                if registry.is_empty() {
+                    "(none; every tool call is refused)".to_string()
+                } else {
+                    registry.names().into_iter().collect::<Vec<_>>().join(", ")
+                }
+            );
             eprintln!("vgctl: no control plane to query yet (Phase 4)");
             Ok(code::UNREACHABLE)
         }
@@ -158,7 +169,8 @@ fn run(args: Args) -> vanguard::Result<u8> {
 
         Command::Replay { session_id } => {
             let ledger = open(&db_path, &config)?;
-            let summary = replay::replay(&ledger, session_id.as_deref(), &limits)?;
+            let names = tools(&config)?.names();
+            let summary = replay::replay(&ledger, session_id.as_deref(), &limits, &names)?;
             for (seq, session, state) in &summary.trace {
                 println!("{seq:>6}  {session:<12} {state}");
             }
@@ -194,12 +206,24 @@ fn run(args: Args) -> vanguard::Result<u8> {
                 .ok_or_else(|| Error::Config(format!("unknown origin {origin:?}")))?;
 
             let ledger = open(&db_path, &config)?;
-            let mut rt = Runtime::new(ledger, limits, Clock::new());
+            let mut rt = Runtime::new(ledger, limits, Clock::new(), tools(&config)?);
             rt.open_session(&session_id)?;
             let outcome = rt.submit(&session_id, event, origin, payload.as_bytes())?;
 
             println!("seq     {}", outcome.record.seq);
             println!("state   {}", outcome.final_state());
+            if let Some(run) = &outcome.tool {
+                match &run.output {
+                    Ok(o) => println!(
+                        "tool    {} ok, {} bytes, {} fuel, {:?}",
+                        run.tool_name,
+                        o.bytes.len(),
+                        o.fuel_used,
+                        o.elapsed
+                    ),
+                    Err(e) => println!("tool    {} failed: {e}", run.tool_name),
+                }
+            }
             if let Some((reason, rec)) = &outcome.halt {
                 println!("halted  {} (seq {})", reason.as_str(), rec.seq);
             }
@@ -217,6 +241,18 @@ fn run(args: Args) -> vanguard::Result<u8> {
 fn open(db_path: &std::path::Path, config: &Config) -> vanguard::Result<Ledger> {
     let key = key::load_or_create(&config.runtime.state_dir)?;
     Ledger::open(db_path, key)
+}
+
+/// Build the registry from the same directory the daemon reads.
+///
+/// `vgctl replay` needs this because a tool appearing or disappearing changes
+/// which proposals the engine would authorize, and replaying against the wrong
+/// set silently reports drift that is really a misconfigured CLI.
+fn tools(config: &Config) -> vanguard::Result<ToolRegistry> {
+    let sandbox = Sandbox::new(config.sandbox_fuel()).map_err(|e| Error::Config(e.to_string()))?;
+    let mut registry = ToolRegistry::new(sandbox);
+    registry.load_dir(&config.tools_dir())?;
+    Ok(registry)
 }
 
 fn truncate(s: &str, n: usize) -> String {
