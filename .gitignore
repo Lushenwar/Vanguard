@@ -1,0 +1,5 @@
+/target
+/.vanguard
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

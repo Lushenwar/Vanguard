@@ -14,24 +14,36 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
-║  VANGUARD BUILD PROGRESS                  0/8 DONE ║
-║  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ALL PHASES PENDING [ ]    ║
-║  See ROADMAP.md for the path from prototype to production.║
-║  Phase 0: Runtime Core, Event Log & Cryptographic Ledger [ ] ║
-║  Phase 1: Deterministic FSM Engine & Guardrails      [ ] ║
-║  Phase 2: WASM Sandboxed Tool Execution Engine       [ ] ║
-║  Phase 3: Context Paging & Memory Eviction Subsystem  [ ] ║
-║  Phase 4: gRPC Control Plane & Local Socket API      [ ] ║
-║  Phase 5: Time-Travel Replay & Mock Execution Engine [ ] ║
-║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter  [ ] ║
-║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [ ] ║
+║  VANGUARD BUILD PROGRESS                       2/8 DONE  ║
+║  ███████░░░░░░░░░░░░░░░░░░░░░  PHASES 0-1 SHIPPED        ║
+║  Phase specs and exit tests live in this file, below.     ║
+║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
+║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
+║  Phase 2: WASM Sandboxed Tool Execution Engine       [ ]  ║
+║  Phase 3: Context Paging & Memory Eviction Subsystem [ ]  ║
+║  Phase 4: gRPC Control Plane & Local Socket API      [ ]  ║
+║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
+║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [ ]  ║
+║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [ ]  ║
 ╚══════════════════════════════════════════════════════════╝
 
 ```
 
-Phase: zero of eight phases completed; implementation for all core subsystems is pending.
+Phase: two of eight phases completed. `[~]` means partially built.
 
-**Phase 0-7 Planning.** System architecture, data flow schemas, gRPC protobuf contracts, and FSM transition functions have been specified. Development will proceed sequentially from Phase 0 (Cryptographic Ledger & Storage) through Phase 7 (eBPF Egress Filtering).
+**Phases 0 and 1 are implemented and tested.** The daemon boots, initialises a WAL-mode SQLite
+ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates proposals
+against a fixed edge table with origin enforcement and step/rejection budgets, appending every
+decision — accepted *and* rejected — to the chain before any state change is visible.
+
+**Phase 5 is partially built.** `vgctl replay` folds a ledger back through the engine offline and
+reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
+half, which cannot exist before Phase 2 gives tools something to execute in.
+
+**Phases 2, 3, 4, 6, 7 are specified but not built.** Each has a named exit test in the
+IMPLEMENTATION CONTRACT below that defines when it is done.
+
+**Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 
 ---
 
@@ -116,34 +128,40 @@ The engine decouples **Reasoning** (probabilistic) from **Execution** (determini
 ## FILE LAYOUT
 
 ```text
-vanguard/
-├── Cargo.toml
-├── build.rs
+vanguard/                          [x] exists  [ ] planned
+├── Cargo.toml                     [x]
+├── config.dev.toml                [x] dev config; keeps a dev run out of /var
 ├── src/
-│   ├── main.rs                 # vanguardd entry point
-│   ├── config.rs               # Engine configuration & parameters
+│   ├── lib.rs                     [x] crate root
+│   ├── main.rs                    [x] vanguardd entry point
+│   ├── config.rs                  [x] TOML config + env overrides
+│   ├── clock.rs                   [x] monotonic ordering vs advisory wall time
+│   ├── error.rs                   [x] crate-wide error type
+│   ├── runtime.rs                 [x] the enforcer: evaluate, commit, then act
 │   ├── fsm/
-│   │   ├── engine.rs           # FSM state machine validator
-│   │   ├── state.rs            # State node & edge definitions
-│   │   └── transition.rs       # Legal transition verifiers
+│   │   ├── engine.rs              [x] pure proposal evaluator
+│   │   ├── state.rs               [x] states, events, origins, reject reasons
+│   │   └── transition.rs          [x] the legal edge set
 │   ├── ledger/
-│   │   ├── db.rs               # SQLite WAL store driver
-│   │   ├── event.rs            # Cryptographic event schema & hashing
-│   │   └── replay.rs           # Replay & time-travel engine
-│   ├── sandbox/
-│   │   ├── wasm.rs             # Wasmtime runtime wrapper & fuel limits
-│   │   └── host_funcs.rs       # Whitelisted host bindings
-│   ├── memory/
-│   │   ├── pager.rs            # Sliding context window manager
-│   │   └── eviction.rs         # LRU token & vector store paging
-│   └── api/
-│       ├── grpc.rs             # tonic gRPC service implementation
-│       └── proto/              # Protobuf definitions
+│   │   ├── db.rs                  [x] SQLite WAL store, single writer
+│   │   ├── event.rs               [x] record shape + HMAC chain
+│   │   ├── key.rs                 [x] key load/create, permission checks
+│   │   └── replay.rs              [x] offline fold back through the engine
+│   ├── sandbox/                   [ ] Phase 2
+│   │   ├── wasm.rs                [ ] wasmtime wrapper & fuel limits
+│   │   └── host_funcs.rs          [ ] whitelisted host bindings
+│   ├── memory/                    [ ] Phase 3
+│   │   ├── pager.rs               [ ] sliding context window manager
+│   │   └── eviction.rs            [ ] LRU token & vector store paging
+│   └── api/                       [ ] Phase 4
+│       ├── grpc.rs                [ ] tonic service implementation
+│       └── proto/                 [ ] protobuf definitions
 ├── bin/
-│   └── vgctl.rs                # CLI debugging & administration tool
+│   └── vgctl.rs                   [x] audit & administration CLI
 └── tests/
-    ├── fsm_tests.rs
-    └── replay_tests.rs
+    ├── fsm_tests.rs               [x] Phase 1 exit tests
+    ├── ledger_tests.rs            [x] Phase 0 exit tests
+    └── replay_tests.rs            [x] replay fidelity tests
 
 ```
 
@@ -270,3 +288,287 @@ cargo test --all-targets --all-features
 * **eBPF Kernel Version Incompatibility:** Kernel environments lacking `CAP_BPF` or operating on Linux $<5.15$ fail to attach socket filters, falling back to permissive networking or failing network boundary guarantees.
 * **Socket File Descriptor Exhaustion:** Rapid administrative socket reconnects starve available file descriptors at `/var/run/vanguard.sock`, blocking CLI tools from querying runtime status.
 * **Stale PID Lockouts:** Abrupt daemon crashes leave behind stale lock files, preventing `vanguardd` from restarting until manual cleanup is performed.
+
+---
+
+# IMPLEMENTATION CONTRACT
+
+Everything above is intent. Everything below is binding: exact states, edges, schema, hashing,
+config keys, error codes, and dependencies. When the two disagree, this section wins, and the
+disagreement is recorded under **SPEC CORRECTIONS**.
+
+## SPEC CORRECTIONS
+
+| # | Original text | Correction | Reason |
+| --- | --- | --- | --- |
+| 1 | Ledger schema shows `"signature": "30450221008f..."` (ECDSA DER) | HMAC-SHA256 chain hash only, no asymmetric signature | Phase 0 exit criteria already says HMAC. One local daemon signing its own log gains nothing from a keypair it also holds; asymmetric signing is only worth it when a *third party* must verify without the write key. Deferred to a future phase if external attestation is ever required. |
+| 2 | `"prev_hash": "a8f5f167..."` shown as 32 hex chars (128-bit) | 32 **bytes** (64 hex chars), SHA-256 width | The example strings are MD5-width. HMAC-SHA256 output is 32 bytes. |
+| 3 | Status block says `See ROADMAP.md` | No `ROADMAP.md` exists; this file is the roadmap | Removed the dangling reference rather than creating a second document to drift out of sync. |
+| 4 | `payload.arguments_hash` | Payload is stored **verbatim** as the exact bytes the proposer submitted, and hashed as those bytes | Canonicalizing JSON before hashing invents a second serializer that replay must reproduce exactly. Storing submitted bytes makes byte-identical replay free. A hash *of* the arguments is derivable from the stored bytes whenever it is wanted. |
+| 5 | "Every state change written to disk before side-effects trigger" | Unchanged, but made concrete: the ledger `INSERT` must return before the tool dispatcher is handed the call | Stated so it is testable rather than aspirational. |
+| 6 | `SessionUnknown` listed as a rejection reason appended to the ledger | Returned as an API error (`Error::UnknownSession`), never as a `REJECTED` row | An event row is a child of a session row; there is no session to attach the rejection to, and inventing a placeholder session so the rejection has a home would let an unauthenticated caller create ledger rows by guessing ids. The variant is kept in `RejectReason` for the wire protocol. |
+| 7 | `src/fsm/` "must not gain a dependency" | It uses `serde_json` to decide payload well-formedness | Payload validity has to be decided in the same place, in the same order, as every other rejection, or replay and the live engine can disagree about the same bytes. `serde_json` is already a Phase 0 dependency; the rule still holds against adding anything *new*. |
+
+## FSM: STATES
+
+Six states. Two are terminal. Serialized as the SCREAMING_SNAKE strings shown.
+
+| State | Meaning | Terminal |
+| --- | --- | --- |
+| `IDLE` | Session exists, no work started | no |
+| `PLANNING` | Awaiting a proposal from the proposer plane | no |
+| `TOOL_EXECUTION` | A tool call is in flight; no proposal is accepted while here | no |
+| `REFLECTING` | A tool result is available and has been handed back to the proposer | no |
+| `DONE` | Session completed normally | **yes** |
+| `HALTED` | Session stopped by the runtime (budget, violation cap, timeout, abort) | **yes** |
+
+Terminal states accept no further events. A proposal against a terminal state is rejected as
+`TerminalState` and still appends a `REJECTED` ledger row — a rejected proposal is evidence and
+is never dropped silently.
+
+## FSM: EVENTS AND ORIGIN
+
+`Origin` is a security boundary, not a label. The proposer plane may submit **only** `PROPOSER`
+events. A `RUNTIME` event arriving over the proposal API is rejected as `ForgedOrigin` before
+edge validation is even consulted — this is what stops a model from fabricating its own tool
+results or clearing its own budget.
+
+| Event | Origin | Carries |
+| --- | --- | --- |
+| `START` | PROPOSER | task description |
+| `EXECUTE_TOOL` | PROPOSER | `tool_name`, arbitrary argument bytes |
+| `FINISH` | PROPOSER | final answer |
+| `TOOL_RESULT` | RUNTIME | tool output or tool error |
+| `ABORT` | RUNTIME | reason |
+
+## FSM: TRANSITION TABLE
+
+The complete edge set. Any (state, event) pair absent from this table is illegal.
+
+| From | Event | To |
+| --- | --- | --- |
+| `IDLE` | `START` | `PLANNING` |
+| `PLANNING` | `EXECUTE_TOOL` | `TOOL_EXECUTION` |
+| `PLANNING` | `FINISH` | `DONE` |
+| `TOOL_EXECUTION` | `TOOL_RESULT` | `REFLECTING` |
+| `REFLECTING` | `EXECUTE_TOOL` | `TOOL_EXECUTION` |
+| `REFLECTING` | `FINISH` | `DONE` |
+| any non-terminal | `ABORT` | `HALTED` |
+
+Note there is no `CONTINUE` event and no return edge to `PLANNING`. `REFLECTING` can dispatch the
+next tool directly. A separate "think again" event that only moves `REFLECTING` to `PLANNING`
+would add a state hop that changes nothing observable and burns a step from the budget.
+
+## FSM: REJECTION REASONS
+
+Every rejection is one of these, appended to the ledger with `status = REJECTED` and
+`to_state = from_state`. The set is closed; there is no `Other`.
+
+| Reason | Trigger |
+| --- | --- |
+| `IllegalEdge` | (state, event) not in the transition table |
+| `TerminalState` | Session already in `DONE` or `HALTED` |
+| `ForgedOrigin` | A `RUNTIME`-origin event submitted through the proposal API |
+| `StepBudgetExhausted` | Accepted-step count already at `limits.max_steps` |
+| `PayloadTooLarge` | Payload exceeds `limits.max_payload_bytes` |
+| `MalformedPayload` | Payload is not valid UTF-8, or not valid JSON |
+| `UnknownTool` | `EXECUTE_TOOL` names a tool absent from the registry |
+| `SessionUnknown` | No such session id |
+
+## BUDGETS AND HALT CONDITIONS
+
+Enforced by the runtime, never by the proposer. Each triggers a `RUNTIME`-origin `ABORT`
+carrying the reason, moving the session to `HALTED`.
+
+| Budget | Default | Halts on |
+| --- | --- | --- |
+| `max_steps` | 50 | Accepted proposer events reach the cap |
+| `max_consecutive_rejects` | 3 | Defense against proposal lock-in loops: the model re-proposing an identical rejected transition forever. Counter resets on any acceptance |
+| `state_timeout_ms` | 30_000 | Wall-clock time in a single non-terminal state. Wall clock is correct here — this bounds *real* hang, and it is never hashed, so it cannot affect replay |
+| `max_payload_bytes` | 65_536 | Rejects the proposal, does not halt the session |
+
+`max_steps` counts **accepted** events only. Rejections are governed by
+`max_consecutive_rejects` instead — otherwise a model that spams invalid transitions could burn
+a session's entire budget without ever executing anything, converting a validation success into
+a denial of service.
+
+## LEDGER: SQLITE SCHEMA
+
+WAL mode, `synchronous = FULL`. `FULL` and not `NORMAL`: under `NORMAL` a power cut can lose
+the trailing committed transactions, which is precisely the "partial write chain break" listed
+in the risk taxonomy. The durability of the last event is the whole product.
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous  = FULL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    created_ms  INTEGER NOT NULL,
+    state       TEXT    NOT NULL,
+    steps       INTEGER NOT NULL DEFAULT 0,
+    rejects     INTEGER NOT NULL DEFAULT 0   -- consecutive
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    seq         INTEGER PRIMARY KEY,          -- global, monotonic, gapless, starts at 1
+    session_id  TEXT    NOT NULL REFERENCES sessions(id),
+    mono_ns     INTEGER NOT NULL,             -- ns since daemon epoch; ordering authority
+    wall_ms     INTEGER NOT NULL,             -- advisory only, NEVER hashed, NEVER ordered on
+    from_state  TEXT    NOT NULL,
+    event       TEXT    NOT NULL,
+    origin      TEXT    NOT NULL,             -- PROPOSER | RUNTIME
+    payload     BLOB    NOT NULL,             -- verbatim submitted bytes
+    status      TEXT    NOT NULL,             -- ACCEPTED | REJECTED
+    reason      TEXT,                         -- rejection reason, NULL when ACCEPTED
+    to_state    TEXT    NOT NULL,
+    prev_hash   BLOB    NOT NULL,             -- 32 bytes
+    hash        BLOB    NOT NULL              -- 32 bytes
+);
+
+CREATE INDEX IF NOT EXISTS events_by_session ON events(session_id, seq);
+```
+
+`seq` is global across sessions, not per-session. One chain over the whole ledger means a
+deleted or reordered event in *any* session breaks verification. Per-session chains would let
+an attacker drop an entire session without leaving a gap.
+
+## LEDGER: HASH CHAIN
+
+```text
+hash_n = HMAC-SHA256(key, prev_hash_n || preimage_n)
+
+preimage_n = seq_be64
+           || len_be32(session_id) || session_id
+           || mono_ns_be64
+           || len_be32(from_state) || from_state
+           || len_be32(event)      || event
+           || len_be32(origin)     || origin
+           || len_be32(status)     || status
+           || len_be32(reason)     || reason        -- empty string when NULL
+           || len_be32(to_state)   || to_state
+           || len_be32(payload)    || payload
+
+prev_hash_1 = [0u8; 32]
+```
+
+Every variable-length field is length-prefixed. Without prefixes, `("AB", "C")` and `("A", "BC")`
+hash identically, and an attacker who controls a payload can shift bytes across a field boundary
+to forge a matching chain. `wall_ms` is excluded because it is not deterministic across replay.
+
+**Key.** 32 random bytes from the OS CSPRNG, written to `<state_dir>/ledger.key` at init with
+owner-only permissions, or supplied via `VANGUARD_LEDGER_KEY` (hex) which takes precedence.
+Refuse to start if the file exists with group/other read permission on Unix.
+
+**Verification.** `vgctl verify` recomputes the chain from `seq = 1`, checking gaplessness and
+each link. It reports the first divergent `seq` and exits `3`. `vanguardd` runs the same check
+at boot and refuses to serve on failure — a corrupt ledger is not something to append to.
+
+## DETERMINISM RULES
+
+Replay is the product's core claim, so these are hard rules in any code path that can affect
+state or the hash chain:
+
+1. No `HashMap`/`HashSet` iteration — `BTreeMap`/`BTreeSet` only. Rust's default hasher is
+   randomly seeded per process, so `HashMap` iteration order differs between the original run
+   and the replay.
+2. No `SystemTime::now()` in hashed fields. `mono_ns` comes from a monotonic `Instant` measured
+   against a daemon epoch captured once at startup.
+3. No RNG in the engine. Keys and session ids are generated at the edges, then recorded.
+4. No floats anywhere in ledger-affecting logic. Payload bytes are opaque, so payload floats are
+   fine — they are never re-serialized.
+5. **Single writer.** All ledger writes go through one owning task fed by an `mpsc` channel.
+   This is the answer to the `SQLITE_BUSY` contention in the risk taxonomy: with exactly one
+   writer there is no write contention to lose, and `seq` allocation needs no separate lock.
+   Readers use separate read-only connections.
+
+## CONFIGURATION
+
+TOML, loaded from `--config <path>`, defaults shown. Any `VANGUARD_<SECTION>_<KEY>` env var
+overrides the corresponding file value.
+
+```toml
+[runtime]
+state_dir   = "/var/lib/vanguard"      # ./.vanguard in dev
+socket      = "/var/run/vanguard.sock"
+log_level   = "info"
+
+[limits]
+max_steps               = 50
+max_consecutive_rejects = 3
+state_timeout_ms        = 30000
+max_payload_bytes       = 65536
+max_context_tokens      = 8192
+
+[sandbox]
+fuel            = 10000000
+max_memory_mb   = 64
+wall_timeout_ms = 50
+
+[egress]
+allow = []                              # empty = deny all
+```
+
+## CLI SURFACE (`vgctl`)
+
+| Command | Does |
+| --- | --- |
+| `vgctl verify [--db <path>]` | Recompute and check the hash chain offline. No daemon needed |
+| `vgctl health` | Daemon liveness and ledger head `seq` |
+| `vgctl state --session-id <id>` | Current state, step count, consecutive rejects |
+| `vgctl ledger [--session-id <id>] [--follow]` | Dump or tail events |
+| `vgctl replay --log <path>` | Offline reconstruction; prints the state sequence |
+| `vgctl propose --session-id <id> --event <E> [--payload <json>]` | Manual proposal, for testing the engine without a model |
+
+Exit codes: `0` ok, `1` runtime error, `2` usage error, `3` chain verification failed,
+`4` daemon unreachable, `5` proposal rejected (the reason goes to stderr).
+
+## DEPENDENCIES
+
+Pinned by phase so that early phases stay buildable without the later, heavier trees.
+
+| Phase | Crates |
+| --- | --- |
+| 0 | `rusqlite` (bundled), `hmac`, `sha2`, `getrandom`, `serde`, `serde_json`, `toml`, `thiserror`, `tracing`, `tracing-subscriber`, `clap` (derive), `tokio` (rt-multi-thread, macros, sync, signal) |
+| 1 | none beyond phase 0 — the FSM is a pure function over enums and must stay dependency-free |
+| 2 | `wasmtime` |
+| 4 | `tonic`, `prost`, `tonic-build` (build-dep) |
+| 6 | `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
+| 7 | `aya`, `aya-bpf` — Linux only, behind `#[cfg(target_os = "linux")]` and an `ebpf` feature |
+
+`src/fsm/` must not gain a dependency. It is the component whose correctness everything else
+rests on, and it is testable in microseconds precisely because it touches nothing.
+
+## PHASE EXIT TESTS
+
+Each phase is done when its named test passes, not when the code looks finished.
+
+| Phase | Test | Proves |
+| --- | --- | --- |
+| 0 | `ledger_chain_survives_restart` | Write N events, drop the DB handle, reopen, verify chain |
+| 0 | `tampered_payload_breaks_chain` | Mutate one payload byte via raw SQL; verify reports that exact `seq` |
+| 1 | `illegal_edges_rejected_without_mutation` | Every (state, event) pair outside the table leaves state unchanged and appends a `REJECTED` row |
+| 1 | `forged_runtime_origin_rejected` | `TOOL_RESULT` submitted as a proposal is rejected as `ForgedOrigin` |
+| 1 | `step_budget_halts_session` | 50 accepted steps then `HALTED`, budget not burnable by rejections |
+| 2 | `spin_loop_hits_fuel_limit` | Infinite-loop WASM module terminates under 50 ms without killing the host |
+| 3 | `context_bounded_over_1000_turns` | Token count never exceeds 8192 across 1000 turns |
+| 4 | `vgctl_roundtrip_over_socket` | State query over the local socket matches the engine |
+| 5 | `replay_reproduces_state_sequence` | Replaying a log yields the identical state sequence and identical head hash |
+| 6 | `no_dropped_spans_under_load` | 1000 req/sec, zero dropped spans |
+| 7 | `egress_blocked_outside_allowlist` | Linux only; skipped elsewhere |
+
+## PLATFORM NOTE (this workstation)
+
+Host is `aarch64-pc-windows-msvc`, but the installed VS 2022 Build Tools ship only the x86/x64
+MSVC libraries — there is no arm64 CRT, so **nothing links on the host toolchain**, including
+build scripts. Build and test with the x64 toolchain, which runs under emulation:
+
+```bash
+cargo +stable-x86_64-pc-windows-msvc test --all-targets
+```
+
+Unix domain sockets are unavailable in this environment for Phase 4 purposes on Windows named
+paths; the control plane binds a loopback TCP port when `cfg(windows)`, and the Unix socket path
+from the config on Unix. Phase 7 (eBPF) cannot be built or tested here at all; it is Linux-only
+and gated behind `#[cfg(target_os = "linux")]`.
