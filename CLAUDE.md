@@ -14,13 +14,13 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
-║  VANGUARD BUILD PROGRESS                       3/8 DONE  ║
-║  ███████████░░░░░░░░░░░░░░░░░  PHASES 0-2 SHIPPED        ║
+║  VANGUARD BUILD PROGRESS                       4/8 DONE  ║
+║  ██████████████░░░░░░░░░░░░░░  PHASES 0-3 SHIPPED        ║
 ║  Phase specs and exit tests live in this file, below.     ║
 ║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
 ║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
 ║  Phase 2: WASM Sandboxed Tool Execution Engine       [x]  ║
-║  Phase 3: Context Paging & Memory Eviction Subsystem [ ]  ║
+║  Phase 3: Context Paging & Memory Eviction Subsystem [x]  ║
 ║  Phase 4: gRPC Control Plane & Local Socket API      [ ]  ║
 ║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
 ║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [ ]  ║
@@ -29,20 +29,22 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```
 
-Phase: three of eight phases completed. `[~]` means partially built.
+Phase: four of eight phases completed. `[~]` means partially built.
 
-**Phases 0, 1 and 2 are implemented and tested.** The daemon boots, initialises a WAL-mode
+**Phases 0 through 3 are implemented and tested.** The daemon boots, initialises a WAL-mode
 SQLite ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates
 proposals against a fixed edge table with origin enforcement and step/rejection budgets,
 appending every decision — accepted *and* rejected — to the chain before any state change is
 visible. An accepted `EXECUTE_TOOL` runs inside a wasmtime sandbox with a fuel ceiling and no
-host bindings whatsoever, and its result comes back as a runtime-origin `TOOL_RESULT`.
+host bindings whatsoever, and its result comes back as a runtime-origin `TOOL_RESULT`. The
+pager assembles a proposer context window that stays inside a fixed token budget however long
+the session runs, replacing evicted turns with a computed digest rather than a summary.
 
 **Phase 5 is partially built.** `vgctl replay` folds a ledger back through the engine offline and
 reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
 half, which cannot exist before Phase 2 gives tools something to execute in.
 
-**Phases 3, 4, 6, 7 are specified but not built.** Each has a named exit test in the
+**Phases 4, 6, 7 are specified but not built.** Each has a named exit test in the
 IMPLEMENTATION CONTRACT below that defines when it is done.
 
 **Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
@@ -153,9 +155,10 @@ vanguard/                          [x] exists  [ ] planned
 │   │   ├── mod.rs                 [x] tool registry = the authorization model
 │   │   ├── wasm.rs                [x] wasmtime wrapper, fuel & memory ceilings
 │   │   └── host_funcs.rs          [ ] deliberately absent; the whitelist is empty
-│   ├── memory/                    [ ] Phase 3
-│   │   ├── pager.rs               [ ] sliding context window manager
-│   │   └── eviction.rs            [ ] LRU token & vector store paging
+│   ├── memory/
+│   │   ├── mod.rs                 [x]
+│   │   ├── pager.rs               [x] bounded window + computed digest
+│   │   └── eviction.rs            [ ] deliberately absent; policy is 12 lines
 │   └── api/                       [ ] Phase 4
 │       ├── grpc.rs                [ ] tonic service implementation
 │       └── proto/                 [ ] protobuf definitions
@@ -167,6 +170,7 @@ vanguard/                          [x] exists  [ ] planned
     ├── common/mod.rs              [x] shared tool fixtures
     ├── fsm_tests.rs               [x] Phase 1 exit tests
     ├── ledger_tests.rs            [x] Phase 0 exit tests
+    ├── memory_tests.rs            [x] Phase 3 exit tests
     ├── sandbox_tests.rs           [x] Phase 2 exit tests
     └── replay_tests.rs            [x] replay fidelity tests
 
@@ -271,6 +275,7 @@ cargo run --bin vgctl -- --config config.dev.toml \
     propose --session-id demo --event EXECUTE_TOOL \
     --payload '{"tool_name":"echo","arguments":{"x":1}}'
 cargo run --bin vgctl -- --config config.dev.toml ledger --session-id demo
+cargo run --bin vgctl -- --config config.dev.toml context --session-id demo --max-tokens 200
 cargo run --bin vgctl -- --config config.dev.toml replay
 cargo run --bin vgctl -- --config config.dev.toml verify
 
@@ -339,6 +344,9 @@ disagreement is recorded under **SPEC CORRECTIONS**.
 | 8 | "Tools execute inside an explicit `WasmInstanceGuard` that handles teardown on drop" | No guard type. `Sandbox::call` owns its `Store` in a stack frame and drops it on every path | In synchronous Rust this *is* the guarantee, and a `Drop` impl that only drops is noise pretending to be a safety mechanism. The guard becomes real when tool execution moves onto a cancellable task in Phase 4, where a dropped future can abandon a call mid-flight — that is the failure the original note describes, and it does not exist yet. |
 | 9 | `MalformedPayload` = "not valid UTF-8, or not valid JSON" | Broadened to "or missing a field this event requires" | An `EXECUTE_TOOL` with no `tool_name` is structurally wrong, not merely naming an absent tool. Keeping it distinct from `UnknownTool` tells an operator whether the proposer sent the wrong *shape* or the wrong *name*, which are different bugs with different fixes. |
 | 10 | Tech stack pins Rust `1.80+` | Rust `1.90+` | `cargo add` resolves against `rust-version`, so a 1.80 floor silently pinned wasmtime to 27. On this workstation wasmtime 27 **aborts the process** on out-of-fuel: the trap is raised from an `extern "C"` libcall that `longjmp`s out, and under x86-64-on-ARM64 emulation the `longjmp` returns instead of unwinding, so control falls off a `nounwind` function. Wasmtime 47 does not have this path. A sandbox that kills the host when a tool exceeds its budget fails the entire point of Phase 2, so the floor moved. |
+| 11 | `memory/eviction.rs`, "LRU token & vector store paging" | No `eviction.rs`, no LRU, no vector store. Eviction is a sliding tail plus a computed digest, inside `pager.rs` | Three separate problems. (a) A vector store is a large dependency with no consumer — nothing in the runtime does similarity search over history. (b) LRU is the wrong policy for a conversation: recency is already the access order, so an LRU cache degenerates to a sliding window with extra bookkeeping. (c) A module holding one function with one caller is a file to open at 3am for no reason. |
+| 12 | "maintaining active state summaries" (Phase 3 exit criteria) | Evicted turns are replaced by a **computed digest** — seq range, accepted/rejected counts, per-tool call tallies, rejection-reason counts — never by generated prose | This is the "lossy compaction cascade" from the risk taxonomy, avoided rather than mitigated. A summariser in this path injects invented text into the prompt that produces the next proposal, and it makes the window nondeterministic, which breaks replay. Counts cannot hallucinate a constraint that was never there. |
+| 13 | "paging cold turns to disk" | Nothing is written anywhere. Evicting a turn means leaving it out of the window | The ledger already *is* the durable record, on disk, addressable by `seq`. A spill file would be a second copy of data we already have, with its own consistency problem and its own way to disagree with the chain. |
 
 ## FSM: STATES
 
@@ -550,6 +558,43 @@ once a host binding exists that can block, since fuel cannot bound time spent ou
 is rejected as `UnknownTool` before anything executes, so an empty registry denies everything.
 Modules are loaded from `<state_dir>/tools/*.{wasm,wat}` and named by file stem.
 
+## CONTEXT PAGING
+
+The proposer sees a **context window**, not the ledger. The window is assembled fresh from the
+event log and always fits `limits.max_context_tokens`.
+
+```text
+SESSION demo
+STATE REFLECTING steps 13/50                 <- pinned: never evicted
+TASK {"task":"never-touch-production"}       <- pinned: the original goal
+EVICTED seq 1-21: 21 events, 21 accepted, 0 rejected
+  tools: echo=10ok/0rej                      <- computed digest, not prose
+#22 EXECUTE_TOOL PROPOSER ACCEPTED - -> TOOL_EXECUTION {"tool_name":"echo",...}
+#23 TOOL_RESULT  RUNTIME  ACCEPTED - -> REFLECTING     {"ok":true,...}
+```
+
+Three rules make this safe to put in front of a model:
+
+1. **The task and the live budget state are pinned.** They are in every window at every budget.
+   A sliding window that drops the original goal to make room for recent chatter produces a model
+   confidently working on the wrong problem — the "working-memory rot" in the risk taxonomy.
+2. **The digest is computed, not written.** Counts, a seq range, per-tool tallies, rejection
+   reasons. Deterministic, replayable, and incapable of inventing a constraint.
+3. **Every event is either live or counted.** `evicted + live == total`, always. The model is told
+   there is a gap and exactly how big it is, rather than being handed a window that silently
+   pretends to be the whole history.
+
+**Token counting** uses a deliberately pessimistic estimator — `ceil(bytes / 3)`. Real tokenizers
+average nearer 4 bytes per token on prose, but ledger payloads are JSON, where punctuation
+tokenizes close to one per character. Over-counting lands the window *under* the real limit;
+under-counting would break the bound the module exists to provide, and the failure would surface
+as a truncated prompt at the model rather than as an error here. A real tokenizer drops in at
+`memory::pager::estimate_tokens` once the model is known.
+
+Per-entry payloads are capped at a quarter of the budget, so one oversized tool result cannot
+consume the window and evict every other turn. Truncation happens on a char boundary and reports
+the bytes dropped.
+
 ## CONFIGURATION
 
 TOML, loaded from `--config <path>`, defaults shown. Any `VANGUARD_<SECTION>_<KEY>` env var
@@ -585,6 +630,7 @@ allow = []                              # empty = deny all
 | `vgctl health` | Daemon liveness and ledger head `seq` |
 | `vgctl state --session-id <id>` | Current state, step count, consecutive rejects |
 | `vgctl ledger [--session-id <id>] [--follow]` | Dump or tail events |
+| `vgctl context --session-id <id> [--max-tokens N] [--stats]` | Render the bounded window a proposer would be given |
 | `vgctl replay --log <path>` | Offline reconstruction; prints the state sequence |
 | `vgctl propose --session-id <id> --event <E> [--payload <json>]` | Manual proposal, for testing the engine without a model |
 
@@ -599,6 +645,7 @@ Pinned by phase so that early phases stay buildable without the later, heavier t
 | --- | --- |
 | 0 | `rusqlite` (bundled), `hmac`, `sha2`, `getrandom`, `serde`, `serde_json`, `toml`, `thiserror`, `tracing`, `tracing-subscriber`, `clap` (derive), `tokio` (rt-multi-thread, macros, sync, signal) |
 | 1 | none beyond phase 0 — the FSM is a pure function over enums and must stay dependency-free |
+| 3 | none beyond phase 0 — the pager reads the ledger and counts; see SPEC CORRECTIONS #11 |
 | 2 | `wasmtime` (47+; see SPEC CORRECTIONS #10) |
 | 4 | `tonic`, `prost`, `tonic-build` (build-dep) |
 | 6 | `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
@@ -621,7 +668,9 @@ Each phase is done when its named test passes, not when the code looks finished.
 | 2 | `spin_loop_hits_fuel_limit` | Infinite-loop WASM module terminates on fuel exhaustion, in under 50 ms |
 | 2 | `tools_cannot_reach_the_host` | A module importing WASI fails to instantiate |
 | 2 | `a_starved_tool_returns_a_result_instead_of_stranding_the_session` | A runaway tool comes back as a `TOOL_RESULT`, not a hung session |
-| 3 | `context_bounded_over_1000_turns` | Token count never exceeds 8192 across 1000 turns |
+| 3 | `context_bounded_over_1000_turns` | Token count never exceeds 8192 across 1000 turns, checked every turn |
+| 3 | `the_task_survives_a_thousand_turns` | The turn-one constraint is still in the window after 2001 events |
+| 3 | `the_window_is_identical_across_rebuilds` | The same ledger renders the same prompt, so the next proposal is reproducible |
 | 4 | `vgctl_roundtrip_over_socket` | State query over the local socket matches the engine |
 | 5 | `replay_reproduces_state_sequence` | Replaying a log yields the identical state sequence and identical head hash |
 | 6 | `no_dropped_spans_under_load` | 1000 req/sec, zero dropped spans |
