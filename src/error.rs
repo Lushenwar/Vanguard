@@ -32,6 +32,16 @@ pub enum Error {
     #[error("unknown session: {0}")]
     UnknownSession(String),
 
+    /// Nothing is listening on the control plane. Its own variant rather than a
+    /// `Config` string because `vgctl` turns it into a distinct exit code, and
+    /// matching on a message is how that silently stops working.
+    #[error("cannot reach vanguardd at {endpoint}: {detail}")]
+    Unreachable { endpoint: String, detail: String },
+
+    /// The daemon answered, but with an error of its own.
+    #[error("control plane: {0}")]
+    ControlPlane(String),
+
     #[error("ledger key at {path} is readable by other users; refusing to start")]
     KeyPermissions { path: PathBuf },
 

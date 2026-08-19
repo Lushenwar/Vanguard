@@ -1,15 +1,25 @@
-//! `vgctl` — administration and debugging.
+//! `vgctl` — administration, audit, and the control-plane client.
 //!
-//! Every subcommand here works directly against the ledger file. That is not a
-//! stopgap for the missing control plane so much as the thing that makes the
-//! ledger auditable at all: verification and replay must be possible without
-//! trusting, or even running, the daemon that wrote the log.
+//! Commands split into two families, and the split is deliberate.
+//!
+//! **Daemon-backed** — `health`, `state`, `propose`, `watch` — go over the
+//! control plane. These need live runtime state, and there is no honest way to
+//! answer them from a file.
+//!
+//! **Offline** — `verify`, `ledger`, `context`, `replay` — read the ledger
+//! directly. That is not a fallback for a missing daemon; it is the property
+//! that makes the ledger auditable at all. Verification and replay must be
+//! possible without trusting, or even running, the process that wrote the log.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use vanguard::api::pb::{
+    HealthRequest, LedgerRequest, ProposalRequest, ReplayRequest, StateRequest,
+};
+use vanguard::api::{self, Client};
 use vanguard::clock::Clock;
 use vanguard::config::Config;
 use vanguard::error::Error;
@@ -46,16 +56,44 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Recompute the hash chain from genesis.
-    Verify,
-    /// Daemon liveness and ledger head.
+    /// Daemon liveness, ledger head, and the registered tool set.
     Health,
-    /// Current FSM state of one session.
+    /// Live FSM state and step performance metrics for one session.
     State {
         #[arg(long)]
         session_id: String,
     },
-    /// Dump ledger events.
+    /// Submit a proposal, without a model in the loop.
+    Propose {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        event: String,
+        #[arg(long, default_value = "{}")]
+        payload: String,
+        /// Drive the engine directly against the ledger file instead of the
+        /// daemon. Requires exclusive access to the database.
+        #[arg(long)]
+        offline: bool,
+        /// Claimed origin. Offline only: over the control plane, origin is a
+        /// property of the transport and cannot be asserted by a caller.
+        #[arg(long, default_value = "PROPOSER")]
+        origin: String,
+    },
+    /// Tail ledger events as they commit.
+    Watch {
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Send the existing log before streaming live events.
+        #[arg(long)]
+        from_start: bool,
+        /// Stop after N events. Without this it runs until interrupted.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Recompute the hash chain from genesis. Offline.
+    Verify,
+    /// Dump ledger events. Offline.
     Ledger {
         #[arg(long)]
         session_id: Option<String>,
@@ -63,7 +101,7 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Render the bounded context window a proposer would be given.
+    /// Render the bounded context window a proposer would be given. Offline.
     Context {
         #[arg(long)]
         session_id: String,
@@ -78,83 +116,226 @@ enum Command {
     Replay {
         #[arg(long)]
         session_id: Option<String>,
-    },
-    /// Submit a proposal directly, without a model in the loop.
-    Propose {
+        /// Ask the running daemon instead of reading the file directly.
         #[arg(long)]
-        session_id: String,
-        #[arg(long)]
-        event: String,
-        #[arg(long, default_value = "{}")]
-        payload: String,
-        /// Claimed origin. Defaults to PROPOSER, which is what a model is.
-        #[arg(long, default_value = "PROPOSER")]
-        origin: String,
+        live: bool,
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let args = Args::parse();
-    match run(args) {
+    match run(args).await {
         Ok(c) => ExitCode::from(c),
         Err(e) => {
             eprintln!("vgctl: {e}");
             ExitCode::from(match e {
                 Error::ChainBroken { .. } | Error::CorruptRow { .. } => code::CHAIN_BROKEN,
+                Error::Unreachable { .. } => code::UNREACHABLE,
                 _ => code::RUNTIME,
             })
         }
     }
 }
 
-fn run(args: Args) -> vanguard::Result<u8> {
+async fn run(args: Args) -> vanguard::Result<u8> {
     let config = Config::load(args.config.as_deref())?;
     let db_path = args.db.clone().unwrap_or_else(|| config.ledger_path());
     let limits = config.fsm_limits();
 
     match args.command {
+        // ------------------------------------------------ daemon-backed
         Command::Health => {
-            // ponytail: no daemon to ask until Phase 4. Reporting the ledger
-            // head is still the useful half, so say what is known and exit 4
-            // rather than pretending the check passed.
-            let ledger = open(&db_path, &config)?;
-            let (seq, hash) = ledger.head();
-            println!("ledger  {}", db_path.display());
-            println!("head    seq={seq} hash={}", hex(&hash));
-            let registry = tools(&config)?;
+            let mut client = client(&config).await?;
+            let h = client
+                .health(HealthRequest {})
+                .await
+                .map_err(rpc)?
+                .into_inner();
+
+            println!("version {}", h.version);
+            println!("uptime  {}s", h.uptime_secs);
+            println!("head    seq={} hash={}", h.head_seq, h.head_hash);
             println!(
-                "tools   {} registered: {}",
-                registry.len(),
-                if registry.is_empty() {
-                    "(none; every tool call is refused)".to_string()
+                "chain   {}",
+                if h.chain_verified {
+                    "verified"
                 } else {
-                    registry.names().into_iter().collect::<Vec<_>>().join(", ")
+                    "BROKEN — run `vgctl verify`"
                 }
             );
-            eprintln!("vgctl: no control plane to query yet (Phase 4)");
-            Ok(code::UNREACHABLE)
+            println!("sessions {}", h.sessions);
+            println!(
+                "tools   {} registered: {}",
+                h.tools.len(),
+                if h.tools.is_empty() {
+                    "(none; every tool call is refused)".to_string()
+                } else {
+                    h.tools.join(", ")
+                }
+            );
+            // A daemon that is up but sitting on a broken chain is not healthy,
+            // whatever else it answered.
+            Ok(if h.chain_verified {
+                code::OK
+            } else {
+                code::CHAIN_BROKEN
+            })
         }
 
+        Command::State { session_id } => {
+            let mut client = client(&config).await?;
+            let s = client
+                .get_state(StateRequest { session_id })
+                .await
+                .map_err(rpc)?
+                .into_inner();
+
+            println!("session {}", s.session_id);
+            println!("state   {}", s.state);
+            println!("steps   {}/{}", s.steps, s.max_steps);
+            println!(
+                "rejects {}/{} consecutive",
+                s.consecutive_rejects, s.max_consecutive_rejects
+            );
+            println!("events  {}", s.events);
+            println!(
+                "context {}/{} tokens",
+                s.context_tokens, s.max_context_tokens
+            );
+            println!(
+                "step    last {} mean {}",
+                micros(s.last_step_nanos),
+                micros(s.mean_step_nanos)
+            );
+            Ok(code::OK)
+        }
+
+        Command::Propose {
+            session_id,
+            event,
+            payload,
+            offline,
+            origin,
+        } => {
+            let event_enum = Event::parse(&event.to_uppercase())
+                .ok_or_else(|| Error::Config(format!("unknown event {event:?}")))?;
+
+            if offline {
+                let origin = Origin::parse(&origin.to_uppercase())
+                    .ok_or_else(|| Error::Config(format!("unknown origin {origin:?}")))?;
+                let ledger = open(&db_path, &config)?;
+                let mut rt = Runtime::new(ledger, limits, Clock::new(), tools(&config)?);
+                rt.open_session(&session_id)?;
+                let outcome = rt.submit(&session_id, event_enum, origin, payload.as_bytes())?;
+
+                println!("seq     {}", outcome.record.seq);
+                println!("state   {}", outcome.final_state());
+                if let Some(run) = &outcome.tool {
+                    match &run.output {
+                        Ok(o) => println!(
+                            "tool    {} ok, {} bytes, {} fuel, {:?}",
+                            run.tool_name,
+                            o.bytes.len(),
+                            o.fuel_used,
+                            o.elapsed
+                        ),
+                        Err(e) => println!("tool    {} failed: {e}", run.tool_name),
+                    }
+                }
+                if let Some((reason, rec)) = &outcome.halt {
+                    println!("halted  {} (seq {})", reason.as_str(), rec.seq);
+                }
+                return Ok(match outcome.decision {
+                    Decision::Accept { .. } => code::OK,
+                    Decision::Reject { reason } => {
+                        eprintln!("vgctl: proposal rejected: {reason}");
+                        code::REJECTED
+                    }
+                });
+            }
+
+            let mut client = client(&config).await?;
+            let r = client
+                .submit_proposal(ProposalRequest {
+                    session_id,
+                    event,
+                    payload: payload.into_bytes(),
+                })
+                .await
+                .map_err(rpc)?
+                .into_inner();
+
+            println!("seq     {}", r.seq);
+            println!("state   {}", r.state);
+            println!("steps   {}/{}", r.steps, r.max_steps);
+            if let Some(tool) = &r.tool {
+                if tool.ok {
+                    println!(
+                        "tool    {} ok, {} fuel, {}µs (seq {})",
+                        tool.tool_name, tool.fuel_used, tool.elapsed_micros, tool.result_seq
+                    );
+                } else {
+                    println!("tool    {} failed: {}", tool.tool_name, tool.error);
+                }
+            }
+            if !r.halt_reason.is_empty() {
+                println!("halted  {}", r.halt_reason);
+            }
+            Ok(if r.accepted {
+                code::OK
+            } else {
+                eprintln!("vgctl: proposal rejected: {}", r.reject_reason);
+                code::REJECTED
+            })
+        }
+
+        Command::Watch {
+            session_id,
+            from_start,
+            limit,
+        } => {
+            let mut client = client(&config).await?;
+            let mut stream = client
+                .stream_ledger(LedgerRequest {
+                    session_id: session_id.unwrap_or_default(),
+                    from_start,
+                })
+                .await
+                .map_err(rpc)?
+                .into_inner();
+
+            let mut seen = 0usize;
+            while let Some(event) = stream.message().await.map_err(rpc)? {
+                let reason = if event.reject_reason.is_empty() {
+                    "-".to_string()
+                } else {
+                    event.reject_reason.clone()
+                };
+                println!(
+                    "{:>6}  {:<12} {:<14} {:<8} {:<8} {:<20} -> {}",
+                    event.seq,
+                    truncate(&event.session_id, 12),
+                    event.event,
+                    event.origin,
+                    event.status,
+                    reason,
+                    event.to_state
+                );
+                seen += 1;
+                if limit.is_some_and(|n| seen >= n) {
+                    break;
+                }
+            }
+            Ok(code::OK)
+        }
+
+        // ------------------------------------------------------- offline
         Command::Verify => {
             let ledger = open(&db_path, &config)?;
             let v = ledger.verify()?;
             println!("ok      {} events", v.events);
             println!("head    seq={} hash={}", v.head_seq, hex(&v.head_hash));
-            Ok(code::OK)
-        }
-
-        Command::State { session_id } => {
-            let ledger = open(&db_path, &config)?;
-            let row = ledger
-                .session(&session_id)?
-                .ok_or(Error::UnknownSession(session_id))?;
-            println!("session {}", row.id);
-            println!("state   {}", row.view.state);
-            println!("steps   {}/{}", row.view.steps, limits.max_steps);
-            println!(
-                "rejects {}/{} consecutive",
-                row.view.consecutive_rejects, limits.max_consecutive_rejects
-            );
             Ok(code::OK)
         }
 
@@ -198,7 +379,32 @@ fn run(args: Args) -> vanguard::Result<u8> {
             Ok(code::OK)
         }
 
-        Command::Replay { session_id } => {
+        Command::Replay { session_id, live } => {
+            if live {
+                let mut client = client(&config).await?;
+                let summary = client
+                    .trigger_replay(ReplayRequest {
+                        session_id: session_id.unwrap_or_default(),
+                    })
+                    .await
+                    .map_err(rpc)?
+                    .into_inner();
+
+                println!("events  {}", summary.events);
+                println!("head    {}", summary.head_hash);
+                if summary.faithful {
+                    println!("replay  faithful");
+                    return Ok(code::OK);
+                }
+                for m in &summary.mismatches {
+                    eprintln!(
+                        "vgctl: seq {} session {}: replay says {}, ledger says {}",
+                        m.seq, m.session_id, m.expected, m.recorded
+                    );
+                }
+                return Ok(code::CHAIN_BROKEN);
+            }
+
             let ledger = open(&db_path, &config)?;
             let names = tools(&config)?.names();
             let summary = replay::replay(&ledger, session_id.as_deref(), &limits, &names)?;
@@ -224,48 +430,29 @@ fn run(args: Args) -> vanguard::Result<u8> {
                 Ok(code::CHAIN_BROKEN)
             }
         }
+    }
+}
 
-        Command::Propose {
-            session_id,
-            event,
-            payload,
-            origin,
-        } => {
-            let event = Event::parse(&event.to_uppercase())
-                .ok_or_else(|| Error::Config(format!("unknown event {event:?}")))?;
-            let origin = Origin::parse(&origin.to_uppercase())
-                .ok_or_else(|| Error::Config(format!("unknown origin {origin:?}")))?;
+async fn client(config: &Config) -> vanguard::Result<Client> {
+    api::connect(&config.control_endpoint()).await
+}
 
-            let ledger = open(&db_path, &config)?;
-            let mut rt = Runtime::new(ledger, limits, Clock::new(), tools(&config)?);
-            rt.open_session(&session_id)?;
-            let outcome = rt.submit(&session_id, event, origin, payload.as_bytes())?;
-
-            println!("seq     {}", outcome.record.seq);
-            println!("state   {}", outcome.final_state());
-            if let Some(run) = &outcome.tool {
-                match &run.output {
-                    Ok(o) => println!(
-                        "tool    {} ok, {} bytes, {} fuel, {:?}",
-                        run.tool_name,
-                        o.bytes.len(),
-                        o.fuel_used,
-                        o.elapsed
-                    ),
-                    Err(e) => println!("tool    {} failed: {e}", run.tool_name),
-                }
-            }
-            if let Some((reason, rec)) = &outcome.halt {
-                println!("halted  {} (seq {})", reason.as_str(), rec.seq);
-            }
-            match outcome.decision {
-                Decision::Accept { .. } => Ok(code::OK),
-                Decision::Reject { reason } => {
-                    eprintln!("vgctl: proposal rejected: {reason}");
-                    Ok(code::REJECTED)
-                }
-            }
-        }
+/// Map a gRPC status back onto the crate's error type.
+///
+/// `data_loss` is preserved as a chain break so the exit code still tells an
+/// operator to stop rather than retry.
+fn rpc(status: tonic::Status) -> Error {
+    match status.code() {
+        tonic::Code::DataLoss => Error::ChainBroken {
+            seq: 0,
+            detail: status.message().to_string(),
+        },
+        tonic::Code::NotFound => Error::UnknownSession(status.message().to_string()),
+        tonic::Code::Unavailable => Error::Unreachable {
+            endpoint: "control plane".into(),
+            detail: status.message().to_string(),
+        },
+        _ => Error::ControlPlane(status.message().to_string()),
     }
 }
 
@@ -284,6 +471,10 @@ fn tools(config: &Config) -> vanguard::Result<ToolRegistry> {
     let mut registry = ToolRegistry::new(sandbox);
     registry.load_dir(&config.tools_dir())?;
     Ok(registry)
+}
+
+fn micros(nanos: u64) -> String {
+    format!("{:.1}µs", nanos as f64 / 1000.0)
 }
 
 fn truncate(s: &str, n: usize) -> String {

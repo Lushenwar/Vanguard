@@ -20,13 +20,17 @@ path = "bin/vgctl.rs"
 clap = { version = "4.5.61", features = ["derive"] }
 getrandom = "0.3.4"
 hmac = "0.12.1"
+prost = "0.14.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
 toml = "1.0.7"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wasmtime = "47"
@@ -34,3 +38,14 @@ wasmtime = "47"
 [dev-dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = "3.27.0"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.6"
+
+# Client-side Unix socket support. tonic's channel needs a custom connector for
+# a non-TCP transport, which pulls in the hyper/tower plumbing; on Windows the
+# control plane is loopback TCP and none of this is needed.
+[target.'cfg(unix)'.dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"

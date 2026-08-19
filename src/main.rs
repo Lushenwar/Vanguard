@@ -1,9 +1,8 @@
 //! `vanguardd` — the runtime daemon.
 //!
-//! Phase 0/1 scope: boot, open the ledger, prove the hash chain, and hold the
-//! session runtime. The gRPC control plane that lets anything talk to it lands
-//! in Phase 4; until then `vgctl` drives the same engine directly against the
-//! ledger file.
+//! Boot order matters: verify the chain, refuse to serve on a break, load the
+//! tool registry, hand the runtime to its own thread, and only then open the
+//! socket. Nothing can talk to a runtime whose ledger has not been proven.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,6 +10,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing::{error, info};
 
+use vanguard::api::{server, Handle};
 use vanguard::clock::Clock;
 use vanguard::config::{Config, APP_NAME};
 use vanguard::fsm::engine::Limits;
@@ -91,24 +91,33 @@ async fn run(args: Args) -> vanguard::Result<ExitCode> {
         info!("no tools registered; every EXECUTE_TOOL proposal will be rejected");
     }
 
-    let _runtime = Runtime::new(ledger, limits, Clock::new(), tools);
+    let runtime = Runtime::new(ledger, limits, Clock::new(), tools);
+    let (handle, runtime_thread) = Handle::spawn(runtime, config.limits.max_context_tokens);
 
+    // Bind before announcing: "ready" should mean the socket is accepting, not
+    // that we are about to try.
+    let listener = server::bind(&config.control_endpoint()).await?;
     info!(
         app = APP_NAME,
         ledger = %ledger_path.display(),
-        socket = %config.runtime.socket.display(),
+        endpoint = %listener.endpoint()?,
         max_steps = limits.max_steps,
         "vanguardd ready"
     );
-    // ponytail: nothing to serve until the Phase 4 control plane exists, so the
-    // daemon parks on the shutdown signal. The socket bind goes here.
-    info!("no control plane yet (Phase 4); waiting for shutdown signal");
 
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(vanguard::Error::from)?;
-    info!("shutting down");
-    Ok(ExitCode::SUCCESS)
+    let result = server::serve(listener, handle.clone(), async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutting down");
+    })
+    .await;
+
+    // Dropping every handle closes the command channel, which is what tells the
+    // runtime thread to finish. Joining before exit means an in-flight commit
+    // completes rather than dying with the process.
+    drop(handle);
+    let _ = runtime_thread.join();
+
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 fn init_tracing(level: &str) {

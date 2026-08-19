@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package vanguard.v1;
+
+// The control plane between vgctl (and any LLM adapter) and vanguardd.
+//
+// Note what is *not* here: no rpc mutates the ledger directly, and no rpc lets
+// a caller set a session's state. The only way state moves is SubmitProposal,
+// which goes through the same FSM evaluation as everything else. A control
+// plane that could bypass the state machine would make the state machine
+// advisory.
+service Control {
+  // Propose an event. Returns acceptance or the reason for rejection; both
+  // outcomes are already durable in the ledger by the time this returns.
+  rpc SubmitProposal(ProposalRequest) returns (ProposalResponse);
+
+  // Current FSM state, budgets, and step timing for one session.
+  rpc GetState(StateRequest) returns (StateResponse);
+
+  // Subscribe to ledger mutations as they commit. Optionally replays the
+  // existing log first, so a late subscriber is not missing history.
+  rpc StreamLedger(LedgerRequest) returns (stream LedgerEvent);
+
+  // Run an offline replay verification against the live ledger.
+  rpc TriggerReplay(ReplayRequest) returns (ReplaySummary);
+
+  // Liveness, ledger head, and the registered tool set.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ---------------------------------------------------------------- proposals
+
+message ProposalRequest {
+  string session_id = 1;
+  // FSM event name, e.g. "EXECUTE_TOOL".
+  string event = 2;
+  // Payload bytes, stored verbatim in the ledger and hashed as-is.
+  bytes payload = 3;
+
+  // There is deliberately no origin field. Origin is a property of the
+  // transport, not a claim the caller gets to make: everything arriving here
+  // is PROPOSER, by construction. A client asking for event = "TOOL_RESULT"
+  // therefore lands in the ledger as a PROPOSER event rejected for
+  // ForgedOrigin -- the attempt is recorded, and it could never have
+  // succeeded. An origin field would make the FSM's origin check a formality
+  // that any caller could satisfy by asserting the right string.
+}
+
+message ProposalResponse {
+  uint64 seq = 1;
+  bool accepted = 2;
+  // Populated only when accepted is false.
+  string reject_reason = 3;
+  string state = 4;
+  uint32 steps = 5;
+  uint32 max_steps = 6;
+  // Present when the runtime halted the session in response.
+  string halt_reason = 7;
+  // Present when the proposal was an accepted EXECUTE_TOOL.
+  ToolRun tool = 8;
+}
+
+message ToolRun {
+  string tool_name = 1;
+  bool ok = 2;
+  // Populated only when ok is false.
+  string error = 3;
+  uint64 fuel_used = 4;
+  uint64 elapsed_micros = 5;
+  uint64 result_seq = 6;
+}
+
+// -------------------------------------------------------------------- state
+
+message StateRequest {
+  string session_id = 1;
+}
+
+message StateResponse {
+  string session_id = 1;
+  string state = 2;
+  uint32 steps = 3;
+  uint32 max_steps = 4;
+  uint32 consecutive_rejects = 5;
+  uint32 max_consecutive_rejects = 6;
+  uint64 events = 7;
+  // Monotonic nanoseconds between the two newest events in this session.
+  uint64 last_step_nanos = 8;
+  // Mean over every adjacent pair in this session.
+  uint64 mean_step_nanos = 9;
+  uint32 context_tokens = 10;
+  uint32 max_context_tokens = 11;
+}
+
+// ------------------------------------------------------------------- ledger
+
+message LedgerRequest {
+  // Empty means every session.
+  string session_id = 1;
+  // Send the existing log before streaming live events.
+  bool from_start = 2;
+}
+
+message LedgerEvent {
+  uint64 seq = 1;
+  string session_id = 2;
+  uint64 mono_ns = 3;
+  string from_state = 4;
+  string event = 5;
+  string origin = 6;
+  bytes payload = 7;
+  string status = 8;
+  string reject_reason = 9;
+  string to_state = 10;
+  // Hex-encoded, 64 characters.
+  string hash = 11;
+}
+
+// ------------------------------------------------------------------- replay
+
+message ReplayRequest {
+  // Empty means every session.
+  string session_id = 1;
+}
+
+message ReplaySummary {
+  uint64 events = 1;
+  bool faithful = 2;
+  string head_hash = 3;
+  repeated Mismatch mismatches = 4;
+}
+
+message Mismatch {
+  uint64 seq = 1;
+  string session_id = 2;
+  string expected = 3;
+  string recorded = 4;
+}
+
+// ------------------------------------------------------------------- health
+
+message HealthRequest {}
+
+message HealthResponse {
+  string version = 1;
+  uint64 head_seq = 2;
+  string head_hash = 3;
+  bool chain_verified = 4;
+  repeated string tools = 5;
+  uint64 sessions = 6;
+  uint64 uptime_secs = 7;
+}
