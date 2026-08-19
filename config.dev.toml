@@ -4,6 +4,7 @@
 [runtime]
 state_dir = "./.vanguard"
 socket    = "./.vanguard/vanguard.sock"
+control_addr = "127.0.0.1:50505"
 log_level = "debug"
 
 [limits]

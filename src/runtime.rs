@@ -78,6 +78,10 @@ impl Runtime {
         &self.tools
     }
 
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
     pub fn tool_names(&self) -> &BTreeSet<String> {
         &self.tool_names
     }

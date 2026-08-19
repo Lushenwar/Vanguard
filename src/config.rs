@@ -9,6 +9,22 @@ use crate::fsm::engine::Limits;
 use crate::sandbox::Fuel;
 
 pub const APP_NAME: &str = "vanguard";
+
+/// Where the control plane lives on this platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    Unix(PathBuf),
+    Tcp(String),
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Unix(path) => write!(f, "unix://{}", path.display()),
+            Endpoint::Tcp(addr) => write!(f, "http://{addr}"),
+        }
+    }
+}
 pub const LEDGER_FILE: &str = "vanguard.sqlite";
 pub const TOOLS_DIR: &str = "tools";
 
@@ -28,7 +44,11 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub state_dir: PathBuf,
+    /// Unix domain socket path. Used on Unix; ignored on Windows.
     pub socket: PathBuf,
+    /// Loopback address for the control plane. Used on Windows, where Tokio
+    /// has no `UnixListener`; ignored on Unix.
+    pub control_addr: String,
     pub log_level: String,
 }
 
@@ -62,6 +82,7 @@ impl Default for RuntimeConfig {
         RuntimeConfig {
             state_dir: PathBuf::from("/var/lib/vanguard"),
             socket: PathBuf::from("/var/run/vanguard.sock"),
+            control_addr: "127.0.0.1:50505".into(),
             log_level: "info".into(),
         }
     }
@@ -125,6 +146,22 @@ impl Config {
         Fuel {
             units: self.sandbox.fuel,
             max_memory_bytes: (self.sandbox.max_memory_mb as usize) * 1024 * 1024,
+        }
+    }
+
+    /// Where the control plane listens, and where `vgctl` should look for it.
+    ///
+    /// Two keys rather than one overloaded string: a path and a socket address
+    /// are different things, and a single field that is sometimes one and
+    /// sometimes the other is a field nobody can validate.
+    pub fn control_endpoint(&self) -> Endpoint {
+        #[cfg(unix)]
+        {
+            Endpoint::Unix(self.runtime.socket.clone())
+        }
+        #[cfg(not(unix))]
+        {
+            Endpoint::Tcp(self.runtime.control_addr.clone())
         }
     }
 

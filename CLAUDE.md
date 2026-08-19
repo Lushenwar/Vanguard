@@ -14,14 +14,14 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
-║  VANGUARD BUILD PROGRESS                       4/8 DONE  ║
-║  ██████████████░░░░░░░░░░░░░░  PHASES 0-3 SHIPPED        ║
+║  VANGUARD BUILD PROGRESS                       5/8 DONE  ║
+║  ██████████████████░░░░░░░░░░  PHASES 0-4 SHIPPED        ║
 ║  Phase specs and exit tests live in this file, below.     ║
 ║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
 ║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
 ║  Phase 2: WASM Sandboxed Tool Execution Engine       [x]  ║
 ║  Phase 3: Context Paging & Memory Eviction Subsystem [x]  ║
-║  Phase 4: gRPC Control Plane & Local Socket API      [ ]  ║
+║  Phase 4: gRPC Control Plane & Local Socket API      [x]  ║
 ║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
 ║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [ ]  ║
 ║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [ ]  ║
@@ -29,22 +29,24 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```
 
-Phase: four of eight phases completed. `[~]` means partially built.
+Phase: five of eight phases completed. `[~]` means partially built.
 
-**Phases 0 through 3 are implemented and tested.** The daemon boots, initialises a WAL-mode
+**Phases 0 through 4 are implemented and tested.** The daemon boots, initialises a WAL-mode
 SQLite ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates
 proposals against a fixed edge table with origin enforcement and step/rejection budgets,
 appending every decision — accepted *and* rejected — to the chain before any state change is
 visible. An accepted `EXECUTE_TOOL` runs inside a wasmtime sandbox with a fuel ceiling and no
 host bindings whatsoever, and its result comes back as a runtime-origin `TOOL_RESULT`. The
 pager assembles a proposer context window that stays inside a fixed token budget however long
-the session runs, replacing evicted turns with a computed digest rather than a summary.
+the session runs, replacing evicted turns with a computed digest rather than a summary. A gRPC
+control plane exposes all of it over a local socket, with the runtime owned by a single thread
+behind a channel.
 
 **Phase 5 is partially built.** `vgctl replay` folds a ledger back through the engine offline and
 reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
 half, which cannot exist before Phase 2 gives tools something to execute in.
 
-**Phases 4, 6, 7 are specified but not built.** Each has a named exit test in the
+**Phases 6 and 7 are specified but not built.** Each has a named exit test in the
 IMPLEMENTATION CONTRACT below that defines when it is done.
 
 **Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
@@ -159,15 +161,21 @@ vanguard/                          [x] exists  [ ] planned
 │   │   ├── mod.rs                 [x]
 │   │   ├── pager.rs               [x] bounded window + computed digest
 │   │   └── eviction.rs            [ ] deliberately absent; policy is 12 lines
-│   └── api/                       [ ] Phase 4
-│       ├── grpc.rs                [ ] tonic service implementation
-│       └── proto/                 [ ] protobuf definitions
+│   └── api/
+│       ├── mod.rs                 [x]
+│       ├── actor.rs               [x] the runtime thread; single writer, structurally
+│       ├── grpc.rs                [x] tonic service; translation only
+│       ├── server.rs              [x] bind/serve, stale-socket reclaim
+│       ├── client.rs              [x] dialling, per-platform transport
+│       └── proto/vanguard.proto   [x] the wire contract
+├── build.rs                       [x] protobuf codegen
 ├── tools/
 │   └── echo.wat                   [x] reference tool; the ABI, executable
 ├── bin/
 │   └── vgctl.rs                   [x] audit & administration CLI
 └── tests/
     ├── common/mod.rs              [x] shared tool fixtures
+    ├── api_tests.rs               [x] Phase 4 exit tests
     ├── fsm_tests.rs               [x] Phase 1 exit tests
     ├── ledger_tests.rs            [x] Phase 0 exit tests
     ├── memory_tests.rs            [x] Phase 3 exit tests
@@ -207,12 +215,56 @@ $$T(S_t, E_{\text{proposed}}) \longrightarrow \begin{cases} (S_{t+1}, A_{\text{e
 
 ## LOCAL API & gRPC SPECIFICATION
 
-Communication between `vgctl` and `vanguardd` takes place over loopback gRPC (`unix:///var/run/vanguard.sock`).
+`vgctl` and any LLM adapter talk to `vanguardd` over local gRPC: a Unix domain socket at
+`runtime.socket` on Unix, loopback TCP at `runtime.control_addr` on Windows. The full contract is
+`src/api/proto/vanguard.proto`.
 
-* `rpc SubmitProposal (ProposalRequest) returns (ProposalResponse)` — Proposes an event from the LLM adapter. Returns immediate state acceptance or rejection.
-* `rpc GetState (StateRequest) returns (StateResponse)` — Returns current FSM state, active step count, and context token utilization.
-* `rpc StreamLedger (LedgerRequest) returns (stream LedgerEvent)` — Subscribes to live event mutations.
-* `rpc TriggerReplay (ReplayRequest) returns (ReplaySummary)` — Pauses live execution and runs an offline replay verification.
+* `rpc SubmitProposal (ProposalRequest) returns (ProposalResponse)` — Proposes an event. Returns acceptance or the rejection reason; both are already durable in the ledger when it returns. An accepted `EXECUTE_TOOL` also carries the tool run and the seq of its `TOOL_RESULT`.
+* `rpc GetState (StateRequest) returns (StateResponse)` — Current FSM state, budgets, context utilisation, and step timings.
+* `rpc StreamLedger (LedgerRequest) returns (stream LedgerEvent)` — Subscribes to committed events, optionally replaying the log first.
+* `rpc TriggerReplay (ReplayRequest) returns (ReplaySummary)` — Runs replay verification against the live ledger.
+* `rpc Health (HealthRequest) returns (HealthResponse)` — Liveness, ledger head, chain status, registered tools.
+
+**No rpc bypasses the FSM.** Nothing here mutates the ledger directly and nothing sets a
+session's state. The only mutation path is `SubmitProposal`, which goes through the same
+evaluation as an in-process call — a control plane that could set state would make the state
+machine advisory. `the_control_plane_cannot_bypass_a_budget` is the test that says so.
+
+**There is no origin field.** See SPEC CORRECTIONS #14: origin is a property of the transport,
+and a caller that could assert it would reduce the FSM's origin check to a formality.
+
+### The runtime is an actor
+
+The `Runtime` is not shared. It is moved onto a dedicated OS thread and reached through a
+`tokio::sync::mpsc` channel, with a `broadcast` channel carrying committed events back out to
+`StreamLedger` subscribers.
+
+```text
+   gRPC handlers ──mpsc──▶ [ vanguard-runtime thread ]
+        ▲                    owns Runtime, Ledger, Sandbox
+        └──broadcast─────────┘
+```
+
+Three things fall out of that shape:
+
+* **Single writer, structurally.** `SQLITE_BUSY` cannot occur because there is still exactly one
+  writer, and `seq` allocation still needs no lock.
+* **No blocked executor.** Wasm execution is synchronous and can burn an entire fuel budget; on a
+  Tokio task that would stall an executor worker for the duration.
+* **Cancellation safety for free.** A client that disconnects mid-call drops a `oneshot::Sender`
+  and nothing else. The tool call it asked for is owned by the runtime thread and runs to
+  completion or to its fuel ceiling either way, so no cancellable future ever holds a wasm
+  `Store` — the async-drop hazard in TECHNICAL REALITIES, closed structurally.
+
+### Two command families in `vgctl`
+
+**Daemon-backed** — `health`, `state`, `propose`, `watch`, `replay --live` — go over the socket.
+These need live runtime state and there is no honest way to answer them from a file. Exit code 4
+when nothing is listening.
+
+**Offline** — `verify`, `ledger`, `context`, `replay` — read the ledger directly. That is not a
+fallback for a missing daemon; it is what makes the ledger auditable. Verification and replay
+must be possible without trusting, or even running, the process that wrote the log.
 
 ---
 
@@ -269,6 +321,7 @@ cargo run --bin vanguardd -- --config config.dev.toml --check   # verify and exi
 
 # Terminal 2 — Drive the engine directly, no model in the loop
 cargo run --bin vgctl -- --config config.dev.toml health
+cargo run --bin vgctl -- --config config.dev.toml watch --from-start --limit 10
 cargo run --bin vgctl -- --config config.dev.toml \
     propose --session-id demo --event START --payload '{"task":"echo-demo"}'
 cargo run --bin vgctl -- --config config.dev.toml \
@@ -341,12 +394,15 @@ disagreement is recorded under **SPEC CORRECTIONS**.
 | 5 | "Every state change written to disk before side-effects trigger" | Unchanged, but made concrete: the ledger `INSERT` must return before the tool dispatcher is handed the call | Stated so it is testable rather than aspirational. |
 | 6 | `SessionUnknown` listed as a rejection reason appended to the ledger | Returned as an API error (`Error::UnknownSession`), never as a `REJECTED` row | An event row is a child of a session row; there is no session to attach the rejection to, and inventing a placeholder session so the rejection has a home would let an unauthenticated caller create ledger rows by guessing ids. The variant is kept in `RejectReason` for the wire protocol. |
 | 7 | `src/fsm/` "must not gain a dependency" | It uses `serde_json` to decide payload well-formedness | Payload validity has to be decided in the same place, in the same order, as every other rejection, or replay and the live engine can disagree about the same bytes. `serde_json` is already a Phase 0 dependency; the rule still holds against adding anything *new*. |
-| 8 | "Tools execute inside an explicit `WasmInstanceGuard` that handles teardown on drop" | No guard type. `Sandbox::call` owns its `Store` in a stack frame and drops it on every path | In synchronous Rust this *is* the guarantee, and a `Drop` impl that only drops is noise pretending to be a safety mechanism. The guard becomes real when tool execution moves onto a cancellable task in Phase 4, where a dropped future can abandon a call mid-flight — that is the failure the original note describes, and it does not exist yet. |
+| 8 | "Tools execute inside an explicit `WasmInstanceGuard` that handles teardown on drop" | No guard type, in Phase 4 either. The runtime owns its thread; a cancelled request drops a `oneshot::Sender` and nothing else | Phase 2 deferred this on the grounds that a stack frame already guarantees teardown, and said the guard would become real once a cancellable task could abandon a call. Phase 4 answered it differently: tool execution never enters a client-cancellable future at all, because it happens on the runtime thread. There is no future to drop mid-call, so there is still nothing for a guard to guard. Covered by `a_cancelled_request_does_not_disturb_the_runtime`. |
 | 9 | `MalformedPayload` = "not valid UTF-8, or not valid JSON" | Broadened to "or missing a field this event requires" | An `EXECUTE_TOOL` with no `tool_name` is structurally wrong, not merely naming an absent tool. Keeping it distinct from `UnknownTool` tells an operator whether the proposer sent the wrong *shape* or the wrong *name*, which are different bugs with different fixes. |
 | 10 | Tech stack pins Rust `1.80+` | Rust `1.90+` | `cargo add` resolves against `rust-version`, so a 1.80 floor silently pinned wasmtime to 27. On this workstation wasmtime 27 **aborts the process** on out-of-fuel: the trap is raised from an `extern "C"` libcall that `longjmp`s out, and under x86-64-on-ARM64 emulation the `longjmp` returns instead of unwinding, so control falls off a `nounwind` function. Wasmtime 47 does not have this path. A sandbox that kills the host when a tool exceeds its budget fails the entire point of Phase 2, so the floor moved. |
 | 11 | `memory/eviction.rs`, "LRU token & vector store paging" | No `eviction.rs`, no LRU, no vector store. Eviction is a sliding tail plus a computed digest, inside `pager.rs` | Three separate problems. (a) A vector store is a large dependency with no consumer — nothing in the runtime does similarity search over history. (b) LRU is the wrong policy for a conversation: recency is already the access order, so an LRU cache degenerates to a sliding window with extra bookkeeping. (c) A module holding one function with one caller is a file to open at 3am for no reason. |
 | 12 | "maintaining active state summaries" (Phase 3 exit criteria) | Evicted turns are replaced by a **computed digest** — seq range, accepted/rejected counts, per-tool call tallies, rejection-reason counts — never by generated prose | This is the "lossy compaction cascade" from the risk taxonomy, avoided rather than mitigated. A summariser in this path injects invented text into the prompt that produces the next proposal, and it makes the window nondeterministic, which breaks replay. Counts cannot hallucinate a constraint that was never there. |
 | 13 | "paging cold turns to disk" | Nothing is written anywhere. Evicting a turn means leaving it out of the window | The ledger already *is* the durable record, on disk, addressable by `seq`. A spill file would be a second copy of data we already have, with its own consistency problem and its own way to disagree with the chain. |
+| 14 | `ProposalRequest` would naturally carry an origin field | There is no origin field. Everything arriving over the control plane is `PROPOSER`, by construction | The FSM's origin check compares the *claimed* origin against the event's required one. If a caller could claim `RUNTIME`, submitting `TOOL_RESULT` with `origin = RUNTIME` would pass that check and let a model fabricate a tool result it never ran — turning the check into a formality any caller could satisfy by asserting the right string. Origin is a property of the transport. A caller naming a runtime-only event is recorded as a `PROPOSER` attempt rejected for `ForgedOrigin`: the attempt is evidence, and it could never have succeeded. |
+| 15 | Single writer via "an `mpsc` channel" (Phase 0 determinism rules) | Now literally true. The runtime lives on a dedicated OS thread behind `tokio::sync::mpsc`; Phase 0 satisfied the rule by ownership alone | Phase 0 marked this as deferred because there was exactly one `Runtime` and no concurrent producers, so a channel would have been ceremony. A server that accepts concurrent requests is what made it necessary. It is an OS thread rather than a Tokio task because wasm execution is synchronous and would otherwise block an executor worker for a whole fuel budget. |
+| 16 | `unix:///var/run/vanguard.sock` as the only transport | Unix socket on Unix, loopback TCP (`runtime.control_addr`) on Windows | Tokio has no `UnixListener` on Windows. Two config keys rather than one overloaded string: a path and a socket address are different things, and a field that is sometimes one and sometimes the other is a field nobody can validate. |
 
 ## FSM: STATES
 
@@ -602,9 +658,10 @@ overrides the corresponding file value.
 
 ```toml
 [runtime]
-state_dir   = "/var/lib/vanguard"      # ./.vanguard in dev
-socket      = "/var/run/vanguard.sock"
-log_level   = "info"
+state_dir    = "/var/lib/vanguard"      # ./.vanguard in dev
+socket       = "/var/run/vanguard.sock" # Unix only
+control_addr = "127.0.0.1:50505"        # Windows only; Tokio has no UnixListener there
+log_level    = "info"
 
 [limits]
 max_steps               = 50
@@ -627,12 +684,13 @@ allow = []                              # empty = deny all
 | Command | Does |
 | --- | --- |
 | `vgctl verify [--db <path>]` | Recompute and check the hash chain offline. No daemon needed |
-| `vgctl health` | Daemon liveness and ledger head `seq` |
+| `vgctl health` | Daemon liveness, ledger head, chain status, registered tools |
+| `vgctl watch [--session-id <id>] [--from-start] [--limit N]` | Tail committed events over the socket |
 | `vgctl state --session-id <id>` | Current state, step count, consecutive rejects |
 | `vgctl ledger [--session-id <id>] [--follow]` | Dump or tail events |
 | `vgctl context --session-id <id> [--max-tokens N] [--stats]` | Render the bounded window a proposer would be given |
-| `vgctl replay --log <path>` | Offline reconstruction; prints the state sequence |
-| `vgctl propose --session-id <id> --event <E> [--payload <json>]` | Manual proposal, for testing the engine without a model |
+| `vgctl replay [--session-id <id>] [--live]` | Offline reconstruction; `--live` asks the daemon instead |
+| `vgctl propose --session-id <id> --event <E> [--payload <json>] [--offline]` | Manual proposal, for testing the engine without a model. `--offline` drives the ledger file directly and is the only place `--origin` may be set |
 
 Exit codes: `0` ok, `1` runtime error, `2` usage error, `3` chain verification failed,
 `4` daemon unreachable, `5` proposal rejected (the reason goes to stderr).
@@ -647,7 +705,7 @@ Pinned by phase so that early phases stay buildable without the later, heavier t
 | 1 | none beyond phase 0 — the FSM is a pure function over enums and must stay dependency-free |
 | 3 | none beyond phase 0 — the pager reads the ledger and counts; see SPEC CORRECTIONS #11 |
 | 2 | `wasmtime` (47+; see SPEC CORRECTIONS #10) |
-| 4 | `tonic`, `prost`, `tonic-build` (build-dep) |
+| 4 | `tonic`, `tonic-prost`, `prost`, `tokio-stream`; `tonic-prost-build` and `protoc-bin-vendored` (build-deps); `hyper-util` and `tower` on Unix only, for the client's socket connector |
 | 6 | `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
 | 7 | `aya`, `aya-bpf` — Linux only, behind `#[cfg(target_os = "linux")]` and an `ebpf` feature |
 
@@ -671,7 +729,10 @@ Each phase is done when its named test passes, not when the code looks finished.
 | 3 | `context_bounded_over_1000_turns` | Token count never exceeds 8192 across 1000 turns, checked every turn |
 | 3 | `the_task_survives_a_thousand_turns` | The turn-one constraint is still in the window after 2001 events |
 | 3 | `the_window_is_identical_across_rebuilds` | The same ledger renders the same prompt, so the next proposal is reproducible |
-| 4 | `vgctl_roundtrip_over_socket` | State query over the local socket matches the engine |
+| 4 | `vgctl_roundtrip_over_socket` | Health, propose, tool dispatch, state and replay all work over the socket |
+| 4 | `a_caller_cannot_claim_runtime_origin` | `TOOL_RESULT` and `ABORT` from the wire are rejected as `ForgedOrigin` |
+| 4 | `the_control_plane_cannot_bypass_a_budget` | The step budget halts a network-driven session |
+| 4 | `a_cancelled_request_does_not_disturb_the_runtime` | An abandoned request still commits; the chain stays intact |
 | 5 | `replay_reproduces_state_sequence` | Replaying a log yields the identical state sequence and identical head hash |
 | 6 | `no_dropped_spans_under_load` | 1000 req/sec, zero dropped spans |
 | 7 | `egress_blocked_outside_allowlist` | Linux only; skipped elsewhere |

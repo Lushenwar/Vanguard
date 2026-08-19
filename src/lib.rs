@@ -5,6 +5,7 @@
 //! a fixed edge set it cannot extend, budgets it cannot raise, and an
 //! append-only ledger it cannot rewrite.
 
+pub mod api;
 pub mod clock;
 pub mod config;
 pub mod error;
