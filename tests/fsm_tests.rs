@@ -1,8 +1,12 @@
 //! Phase 1 exit tests: the FSM rejects what it must, cheaply, without mutating
 //! state, and the runtime writes evidence of every rejection.
 
+mod common;
+
+use std::collections::BTreeSet;
 use std::time::Instant;
 
+use common::{echo_names, echo_registry};
 use vanguard::clock::Clock;
 use vanguard::fsm::engine::{self, Decision, Limits, SessionView};
 use vanguard::fsm::state::{Event, Origin, RejectReason, State};
@@ -10,11 +14,24 @@ use vanguard::fsm::transition;
 use vanguard::ledger::{Ledger, Status};
 use vanguard::runtime::Runtime;
 
+const ECHO_CALL: &[u8] = br#"{"tool_name":"echo"}"#;
+
 fn runtime_with(limits: Limits) -> Runtime {
     let ledger = Ledger::open_in_memory([0x2c; 32]).unwrap();
-    let mut rt = Runtime::new(ledger, limits, Clock::new());
+    let mut rt = Runtime::new(ledger, limits, Clock::new(), echo_registry());
     rt.open_session("s").unwrap();
     rt
+}
+
+fn eval(session: SessionView, limits: &Limits, event: Event, payload: &[u8]) -> Decision {
+    engine::evaluate(
+        session,
+        limits,
+        event,
+        event.origin(),
+        payload,
+        &echo_names(),
+    )
 }
 
 #[test]
@@ -31,8 +48,7 @@ fn illegal_edges_rejected_without_mutation() {
                 steps: 0,
                 consecutive_rejects: 0,
             };
-            let decision =
-                engine::evaluate(session, &Limits::default(), event, event.origin(), b"{}");
+            let decision = eval(session, &Limits::default(), event, ECHO_CALL);
             let reason = match decision {
                 Decision::Reject { reason } => reason,
                 Decision::Accept { .. } => panic!("({from}, {event}) was accepted but is illegal"),
@@ -74,18 +90,53 @@ fn illegal_transition_is_logged_as_evidence() {
 
 #[test]
 fn forged_runtime_origin_rejected() {
+    // TOOL_RESULT from TOOL_EXECUTION is a legal edge — the only thing wrong
+    // with this proposal is who claims to be sending it. Checked at the engine
+    // level because the runtime never rests in TOOL_EXECUTION: dispatch is
+    // synchronous, so there is no window in which a proposal could arrive.
+    let in_tool = SessionView {
+        state: State::ToolExecution,
+        steps: 1,
+        consecutive_rejects: 0,
+    };
+    let forged = engine::evaluate(
+        in_tool,
+        &Limits::default(),
+        Event::ToolResult,
+        Origin::Proposer,
+        br#"{"ok":true}"#,
+        &echo_names(),
+    );
+    assert_eq!(
+        forged,
+        Decision::Reject {
+            reason: RejectReason::ForgedOrigin
+        }
+    );
+
+    // The same event from the runtime is accepted.
+    let honest = engine::evaluate(
+        in_tool,
+        &Limits::default(),
+        Event::ToolResult,
+        Origin::Runtime,
+        br#"{"ok":true}"#,
+        &echo_names(),
+    );
+    assert!(honest.is_accept());
+}
+
+#[test]
+fn a_proposer_cannot_abort_its_own_session() {
+    // The reachable half of the same defense: ABORT is runtime-only, so a model
+    // cannot end its session — and stop the ledger accruing evidence — by
+    // asking to.
     let mut rt = runtime_with(Limits::default());
     rt.submit("s", Event::Start, Origin::Proposer, b"{}")
         .unwrap();
-    rt.submit("s", Event::ExecuteTool, Origin::Proposer, b"{}")
-        .unwrap();
-    assert_eq!(rt.session("s").unwrap().state, State::ToolExecution);
 
-    // TOOL_RESULT here is a legal edge — the only thing wrong with it is who is
-    // claiming to send it. A model fabricating its own tool output must not be
-    // able to advance the machine.
     let out = rt
-        .submit("s", Event::ToolResult, Origin::Proposer, br#"{"ok":true}"#)
+        .submit("s", Event::Abort, Origin::Proposer, b"{}")
         .unwrap();
     assert_eq!(
         out.decision,
@@ -93,14 +144,31 @@ fn forged_runtime_origin_rejected() {
             reason: RejectReason::ForgedOrigin
         }
     );
-    assert_eq!(rt.session("s").unwrap().state, State::ToolExecution);
+    assert_eq!(rt.session("s").unwrap().state, State::Planning);
+}
 
-    // The same event from the runtime is accepted.
-    let out = rt
-        .submit("s", Event::ToolResult, Origin::Runtime, br#"{"ok":true}"#)
+#[test]
+fn unknown_tool_never_reaches_the_sandbox() {
+    let mut rt = runtime_with(Limits::default());
+    rt.submit("s", Event::Start, Origin::Proposer, b"{}")
         .unwrap();
-    assert!(out.decision.is_accept());
-    assert_eq!(rt.session("s").unwrap().state, State::Reflecting);
+
+    let out = rt
+        .submit(
+            "s",
+            Event::ExecuteTool,
+            Origin::Proposer,
+            br#"{"tool_name":"rm_rf"}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        out.decision,
+        Decision::Reject {
+            reason: RejectReason::UnknownTool
+        }
+    );
+    assert!(out.tool.is_none(), "an unregistered tool must not execute");
+    assert_eq!(rt.session("s").unwrap().state, State::Planning);
 }
 
 #[test]
@@ -116,23 +184,20 @@ fn step_budget_halts_session() {
 
     rt.submit("s", Event::Start, Origin::Proposer, b"{}")
         .unwrap();
-    let mut halted_at = None;
-    // Alternate EXECUTE_TOOL / TOOL_RESULT forever; only the tool calls are
-    // proposer steps, so the budget must stop this at 6 and not 12.
-    for i in 0..20 {
-        let state = rt.session("s").unwrap().state;
-        if state.is_terminal() {
-            halted_at = Some(i);
+
+    // Each EXECUTE_TOOL also produces a runtime TOOL_RESULT, which spends no
+    // step. The budget must therefore stop this at 6 proposals, not 12 events.
+    let mut halted = false;
+    for _ in 0..20 {
+        if rt.session("s").unwrap().state.is_terminal() {
+            halted = true;
             break;
         }
-        let (event, origin) = match state {
-            State::ToolExecution => (Event::ToolResult, Origin::Runtime),
-            _ => (Event::ExecuteTool, Origin::Proposer),
-        };
-        rt.submit("s", event, origin, b"{}").unwrap();
+        rt.submit("s", Event::ExecuteTool, Origin::Proposer, ECHO_CALL)
+            .unwrap();
     }
 
-    assert!(halted_at.is_some(), "session never halted");
+    assert!(halted, "session never halted");
     let view = rt.session("s").unwrap();
     assert_eq!(view.state, State::Halted);
     assert_eq!(view.steps, limits.max_steps);
@@ -222,11 +287,19 @@ fn rejection_is_decided_well_under_a_millisecond() {
     };
     let limits = Limits::default();
     let payload = br#"{"tool_name":"fetch_http","arguments":{"url":"https://example.com"}}"#;
+    let tools: BTreeSet<String> = BTreeSet::new();
 
     let iterations = 10_000;
     let start = Instant::now();
     for _ in 0..iterations {
-        let d = engine::evaluate(session, &limits, Event::Start, Origin::Proposer, payload);
+        let d = engine::evaluate(
+            session,
+            &limits,
+            Event::Start,
+            Origin::Proposer,
+            payload,
+            &tools,
+        );
         std::hint::black_box(d);
     }
     let per_call = start.elapsed() / iterations;

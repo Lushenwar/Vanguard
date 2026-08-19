@@ -6,6 +6,8 @@
 //! dispatching a tool, halting a session — happens in `runtime`, which calls
 //! this and then acts on the answer.
 
+use std::collections::BTreeSet;
+
 use super::state::{Event, Origin, RejectReason, State};
 use super::transition;
 
@@ -117,6 +119,7 @@ pub fn evaluate(
     event: Event,
     submitted_origin: Origin,
     payload: &[u8],
+    tools: &BTreeSet<String>,
 ) -> Decision {
     // 1. Origin, before anything else. A proposer submitting TOOL_RESULT is a
     //    model trying to fabricate a tool it never ran; that must be rejected
@@ -143,9 +146,20 @@ pub fn evaluate(
         return reject(RejectReason::MalformedPayload);
     }
 
+    // 5. A tool call must name a tool that exists. Absence of a rule is a
+    //    denial, so an empty registry refuses every tool — the right posture
+    //    for a runtime that has not been told what it is allowed to run.
+    if event == Event::ExecuteTool {
+        match tool_name(payload) {
+            None => return reject(RejectReason::MalformedPayload),
+            Some(name) if !tools.contains(&name) => return reject(RejectReason::UnknownTool),
+            Some(_) => {}
+        }
+    }
+
     let consumes_step = event.origin() == Origin::Proposer;
 
-    // 5. Budget. Normally the runtime halts the session the moment the last
+    // 6. Budget. Normally the runtime halts the session the moment the last
     //    step is spent, so this is a backstop: it is reachable when the daemon
     //    crashed between appending the final step and appending its ABORT, and
     //    the session was reloaded still non-terminal.
@@ -153,7 +167,7 @@ pub fn evaluate(
         return reject(RejectReason::StepBudgetExhausted);
     }
 
-    // 6. Finally the edge table.
+    // 7. Finally the edge table.
     match transition::next(session.state, event) {
         Some(to) => Decision::Accept { to, consumes_step },
         None => reject(RejectReason::IllegalEdge),
@@ -197,6 +211,21 @@ fn reject(reason: RejectReason) -> Decision {
     Decision::Reject { reason }
 }
 
+/// The tool an `EXECUTE_TOOL` payload names, if it names one at all.
+///
+/// Public because the runtime needs the same answer the evaluator got: if the
+/// two disagreed about which tool a payload refers to, the FSM would authorize
+/// one tool and the dispatcher would run another.
+pub fn tool_name(payload: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        tool_name: String,
+    }
+    serde_json::from_slice::<Named>(payload)
+        .ok()
+        .map(|n| n.tool_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,9 +237,27 @@ mod tests {
         }
     }
 
+    fn no_tools() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn with_echo() -> BTreeSet<String> {
+        ["echo".to_string()].into_iter().collect()
+    }
+
+    fn eval(
+        session: SessionView,
+        limits: &Limits,
+        event: Event,
+        origin: Origin,
+        payload: &[u8],
+    ) -> Decision {
+        evaluate(session, limits, event, origin, payload, &with_echo())
+    }
+
     #[test]
     fn legal_proposer_edge_is_accepted() {
-        let d = evaluate(
+        let d = eval(
             view(State::Idle),
             &Limits::default(),
             Event::Start,
@@ -230,7 +277,7 @@ mod tests {
     fn forged_origin_beats_every_other_check() {
         // TOOL_RESULT from TOOL_EXECUTION is a legal edge, so this proposal
         // would be accepted if origin were checked later or not at all.
-        let d = evaluate(
+        let d = eval(
             view(State::ToolExecution),
             &Limits::default(),
             Event::ToolResult,
@@ -247,7 +294,7 @@ mod tests {
 
     #[test]
     fn runtime_events_do_not_spend_steps() {
-        let d = evaluate(
+        let d = eval(
             view(State::ToolExecution),
             &Limits::default(),
             Event::ToolResult,
@@ -267,7 +314,13 @@ mod tests {
     fn rejections_never_move_state() {
         for from in State::ALL {
             for event in Event::ALL {
-                let d = evaluate(view(from), &Limits::default(), event, event.origin(), b"{}");
+                let d = eval(
+                    view(from),
+                    &Limits::default(),
+                    event,
+                    event.origin(),
+                    br#"{"tool_name":"echo"}"#,
+                );
                 if let Decision::Reject { .. } = d {
                     assert_eq!(apply(view(from), d).state, from);
                 }
@@ -283,7 +336,7 @@ mod tests {
         };
         // Invalid JSON *and* oversized: the size check must win, proving the
         // parser never saw it.
-        let d = evaluate(
+        let d = eval(
             view(State::Idle),
             &limits,
             Event::Start,
@@ -300,7 +353,7 @@ mod tests {
 
     #[test]
     fn malformed_payload_rejected() {
-        let d = evaluate(
+        let d = eval(
             view(State::Idle),
             &Limits::default(),
             Event::Start,
@@ -316,6 +369,78 @@ mod tests {
     }
 
     #[test]
+    fn unknown_tool_rejected() {
+        let d = eval(
+            view(State::Planning),
+            &Limits::default(),
+            Event::ExecuteTool,
+            Origin::Proposer,
+            br#"{"tool_name":"rm_rf"}"#,
+        );
+        assert_eq!(
+            d,
+            Decision::Reject {
+                reason: RejectReason::UnknownTool
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_denies_every_tool() {
+        // The default posture. A runtime that has not been told what it may run
+        // must run nothing, not everything.
+        let d = evaluate(
+            view(State::Planning),
+            &Limits::default(),
+            Event::ExecuteTool,
+            Origin::Proposer,
+            br#"{"tool_name":"echo"}"#,
+            &no_tools(),
+        );
+        assert_eq!(
+            d,
+            Decision::Reject {
+                reason: RejectReason::UnknownTool
+            }
+        );
+    }
+
+    #[test]
+    fn tool_call_without_a_tool_name_is_malformed() {
+        let d = eval(
+            view(State::Planning),
+            &Limits::default(),
+            Event::ExecuteTool,
+            Origin::Proposer,
+            br#"{"arguments":{}}"#,
+        );
+        assert_eq!(
+            d,
+            Decision::Reject {
+                reason: RejectReason::MalformedPayload
+            }
+        );
+    }
+
+    #[test]
+    fn known_tool_is_accepted() {
+        let d = eval(
+            view(State::Planning),
+            &Limits::default(),
+            Event::ExecuteTool,
+            Origin::Proposer,
+            br#"{"tool_name":"echo"}"#,
+        );
+        assert_eq!(
+            d,
+            Decision::Accept {
+                to: State::ToolExecution,
+                consumes_step: true
+            }
+        );
+    }
+
+    #[test]
     fn exhausted_budget_rejects_without_halting_state() {
         let limits = Limits::default();
         let session = SessionView {
@@ -323,7 +448,7 @@ mod tests {
             steps: limits.max_steps,
             consecutive_rejects: 0,
         };
-        let d = evaluate(session, &limits, Event::Finish, Origin::Proposer, b"{}");
+        let d = eval(session, &limits, Event::Finish, Origin::Proposer, b"{}");
         assert_eq!(
             d,
             Decision::Reject {
@@ -389,5 +514,16 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn tool_name_extraction_is_strict() {
+        assert_eq!(
+            tool_name(br#"{"tool_name":"echo"}"#).as_deref(),
+            Some("echo")
+        );
+        assert_eq!(tool_name(br#"{"tool_name":7}"#), None);
+        assert_eq!(tool_name(b"{}"), None);
+        assert_eq!(tool_name(b"garbage"), None);
     }
 }

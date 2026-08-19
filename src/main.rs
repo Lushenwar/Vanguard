@@ -16,6 +16,7 @@ use vanguard::config::{Config, APP_NAME};
 use vanguard::fsm::engine::Limits;
 use vanguard::ledger::{key, Ledger};
 use vanguard::runtime::Runtime;
+use vanguard::sandbox::{Sandbox, ToolRegistry};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -72,7 +73,25 @@ async fn run(args: Args) -> vanguard::Result<ExitCode> {
     }
 
     let limits: Limits = config.fsm_limits();
-    let _runtime = Runtime::new(ledger, limits, Clock::new());
+
+    let sandbox =
+        Sandbox::new(config.sandbox_fuel()).map_err(|e| vanguard::Error::Config(e.to_string()))?;
+    let mut tools = ToolRegistry::new(sandbox);
+    let tools_dir = config.tools_dir();
+    let loaded = tools.load_dir(&tools_dir)?;
+    info!(
+        count = loaded,
+        dir = %tools_dir.display(),
+        fuel = config.sandbox.fuel,
+        "tool registry loaded"
+    );
+    if loaded == 0 {
+        // Worth saying out loud: an empty registry is a working configuration
+        // that refuses every tool, which looks identical to a broken one.
+        info!("no tools registered; every EXECUTE_TOOL proposal will be rejected");
+    }
+
+    let _runtime = Runtime::new(ledger, limits, Clock::new(), tools);
 
     info!(
         app = APP_NAME,

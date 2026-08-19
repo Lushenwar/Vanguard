@@ -14,12 +14,12 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
-║  VANGUARD BUILD PROGRESS                       2/8 DONE  ║
-║  ███████░░░░░░░░░░░░░░░░░░░░░  PHASES 0-1 SHIPPED        ║
+║  VANGUARD BUILD PROGRESS                       3/8 DONE  ║
+║  ███████████░░░░░░░░░░░░░░░░░  PHASES 0-2 SHIPPED        ║
 ║  Phase specs and exit tests live in this file, below.     ║
 ║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
 ║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
-║  Phase 2: WASM Sandboxed Tool Execution Engine       [ ]  ║
+║  Phase 2: WASM Sandboxed Tool Execution Engine       [x]  ║
 ║  Phase 3: Context Paging & Memory Eviction Subsystem [ ]  ║
 ║  Phase 4: gRPC Control Plane & Local Socket API      [ ]  ║
 ║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
@@ -29,18 +29,20 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```
 
-Phase: two of eight phases completed. `[~]` means partially built.
+Phase: three of eight phases completed. `[~]` means partially built.
 
-**Phases 0 and 1 are implemented and tested.** The daemon boots, initialises a WAL-mode SQLite
-ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates proposals
-against a fixed edge table with origin enforcement and step/rejection budgets, appending every
-decision — accepted *and* rejected — to the chain before any state change is visible.
+**Phases 0, 1 and 2 are implemented and tested.** The daemon boots, initialises a WAL-mode
+SQLite ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates
+proposals against a fixed edge table with origin enforcement and step/rejection budgets,
+appending every decision — accepted *and* rejected — to the chain before any state change is
+visible. An accepted `EXECUTE_TOOL` runs inside a wasmtime sandbox with a fuel ceiling and no
+host bindings whatsoever, and its result comes back as a runtime-origin `TOOL_RESULT`.
 
 **Phase 5 is partially built.** `vgctl replay` folds a ledger back through the engine offline and
 reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
 half, which cannot exist before Phase 2 gives tools something to execute in.
 
-**Phases 2, 3, 4, 6, 7 are specified but not built.** Each has a named exit test in the
+**Phases 3, 4, 6, 7 are specified but not built.** Each has a named exit test in the
 IMPLEMENTATION CONTRACT below that defines when it is done.
 
 **Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
@@ -147,20 +149,25 @@ vanguard/                          [x] exists  [ ] planned
 │   │   ├── event.rs               [x] record shape + HMAC chain
 │   │   ├── key.rs                 [x] key load/create, permission checks
 │   │   └── replay.rs              [x] offline fold back through the engine
-│   ├── sandbox/                   [ ] Phase 2
-│   │   ├── wasm.rs                [ ] wasmtime wrapper & fuel limits
-│   │   └── host_funcs.rs          [ ] whitelisted host bindings
+│   ├── sandbox/
+│   │   ├── mod.rs                 [x] tool registry = the authorization model
+│   │   ├── wasm.rs                [x] wasmtime wrapper, fuel & memory ceilings
+│   │   └── host_funcs.rs          [ ] deliberately absent; the whitelist is empty
 │   ├── memory/                    [ ] Phase 3
 │   │   ├── pager.rs               [ ] sliding context window manager
 │   │   └── eviction.rs            [ ] LRU token & vector store paging
 │   └── api/                       [ ] Phase 4
 │       ├── grpc.rs                [ ] tonic service implementation
 │       └── proto/                 [ ] protobuf definitions
+├── tools/
+│   └── echo.wat                   [x] reference tool; the ABI, executable
 ├── bin/
 │   └── vgctl.rs                   [x] audit & administration CLI
 └── tests/
+    ├── common/mod.rs              [x] shared tool fixtures
     ├── fsm_tests.rs               [x] Phase 1 exit tests
     ├── ledger_tests.rs            [x] Phase 0 exit tests
+    ├── sandbox_tests.rs           [x] Phase 2 exit tests
     └── replay_tests.rs            [x] replay fidelity tests
 
 ```
@@ -243,18 +250,39 @@ Communication between `vgctl` and `vanguardd` takes place over loopback gRPC (`u
 
 ## RUNNING & TESTING
 
+On this workstation every `cargo` invocation below needs
+`+stable-x86_64-pc-windows-msvc` — see PLATFORM NOTE.
+
 ```bash
+# One-time: give the dev state dir a tool to run. The registry is the
+# authorization model, so a daemon with no tools directory refuses every
+# EXECUTE_TOOL proposal -- which is correct, and looks exactly like a bug.
+mkdir -p .vanguard/tools && cp tools/echo.wat .vanguard/tools/
+
 # Terminal 1 — Run runtime daemon in debug mode
 cargo run --bin vanguardd -- --config config.dev.toml
+cargo run --bin vanguardd -- --config config.dev.toml --check   # verify and exit
 
-# Terminal 2 — Inspect system health and active FSM state
-cargo run --bin vgctl -- health
-cargo run --bin vgctl -- state --session-id default
+# Terminal 2 — Drive the engine directly, no model in the loop
+cargo run --bin vgctl -- --config config.dev.toml health
+cargo run --bin vgctl -- --config config.dev.toml \
+    propose --session-id demo --event START --payload '{"task":"echo-demo"}'
+cargo run --bin vgctl -- --config config.dev.toml \
+    propose --session-id demo --event EXECUTE_TOOL \
+    --payload '{"tool_name":"echo","arguments":{"x":1}}'
+cargo run --bin vgctl -- --config config.dev.toml ledger --session-id demo
+cargo run --bin vgctl -- --config config.dev.toml replay
+cargo run --bin vgctl -- --config config.dev.toml verify
 
 # Execute full suite of unit and integration tests
 cargo test --all-targets --all-features
 
 ```
+
+One accepted `EXECUTE_TOOL` produces **two** ledger events: the authorization,
+then the runtime-origin `TOOL_RESULT` carrying what the sandbox returned. The
+session never rests in `TOOL_EXECUTION` — dispatch is synchronous, so there is
+no window in which a proposal could arrive while a tool is in flight.
 
 ---
 
@@ -308,6 +336,9 @@ disagreement is recorded under **SPEC CORRECTIONS**.
 | 5 | "Every state change written to disk before side-effects trigger" | Unchanged, but made concrete: the ledger `INSERT` must return before the tool dispatcher is handed the call | Stated so it is testable rather than aspirational. |
 | 6 | `SessionUnknown` listed as a rejection reason appended to the ledger | Returned as an API error (`Error::UnknownSession`), never as a `REJECTED` row | An event row is a child of a session row; there is no session to attach the rejection to, and inventing a placeholder session so the rejection has a home would let an unauthenticated caller create ledger rows by guessing ids. The variant is kept in `RejectReason` for the wire protocol. |
 | 7 | `src/fsm/` "must not gain a dependency" | It uses `serde_json` to decide payload well-formedness | Payload validity has to be decided in the same place, in the same order, as every other rejection, or replay and the live engine can disagree about the same bytes. `serde_json` is already a Phase 0 dependency; the rule still holds against adding anything *new*. |
+| 8 | "Tools execute inside an explicit `WasmInstanceGuard` that handles teardown on drop" | No guard type. `Sandbox::call` owns its `Store` in a stack frame and drops it on every path | In synchronous Rust this *is* the guarantee, and a `Drop` impl that only drops is noise pretending to be a safety mechanism. The guard becomes real when tool execution moves onto a cancellable task in Phase 4, where a dropped future can abandon a call mid-flight — that is the failure the original note describes, and it does not exist yet. |
+| 9 | `MalformedPayload` = "not valid UTF-8, or not valid JSON" | Broadened to "or missing a field this event requires" | An `EXECUTE_TOOL` with no `tool_name` is structurally wrong, not merely naming an absent tool. Keeping it distinct from `UnknownTool` tells an operator whether the proposer sent the wrong *shape* or the wrong *name*, which are different bugs with different fixes. |
+| 10 | Tech stack pins Rust `1.80+` | Rust `1.90+` | `cargo add` resolves against `rust-version`, so a 1.80 floor silently pinned wasmtime to 27. On this workstation wasmtime 27 **aborts the process** on out-of-fuel: the trap is raised from an `extern "C"` libcall that `longjmp`s out, and under x86-64-on-ARM64 emulation the `longjmp` returns instead of unwinding, so control falls off a `nounwind` function. Wasmtime 47 does not have this path. A sandbox that kills the host when a tool exceeds its budget fails the entire point of Phase 2, so the floor moved. |
 
 ## FSM: STATES
 
@@ -483,6 +514,42 @@ state or the hash chain:
    writer there is no write contention to lose, and `seq` allocation needs no separate lock.
    Readers use separate read-only connections.
 
+## TOOL ABI AND SANDBOX
+
+A tool is a WebAssembly module that **imports nothing** and exports exactly three things:
+
+| Export | Signature | Meaning |
+| --- | --- | --- |
+| `memory` | — | Its linear memory |
+| `alloc` | `(i32) -> i32` | Reserve `n` bytes, return the offset |
+| `run` | `(i32, i32) -> i64` | Take `(ptr, len)` of the input, return `(ptr << 32) \| len` of the output |
+
+The result is packed into one `i64` to avoid multi-value returns and host-side out-parameters,
+neither of which earns its ABI weight here. The host bounds-checks the returned range against the
+guest's own memory before reading it — `packed` is a value the guest chose, and a guest that
+points past the end of its memory must not get host bytes back.
+
+Tool input is the `EXECUTE_TOOL` payload verbatim. Tool output must itself be valid JSON; it is
+wrapped as `{"ok":true,"output":<output>}`, or `{"ok":false,"error":"<why>"}` on failure, and that
+wrapper is the `TOOL_RESULT` payload. Output that is not JSON is reported as a failed call rather
+than stored as an opaque blob — a payload the auditor cannot parse is a payload the auditor
+cannot audit.
+
+**The host binding whitelist is empty.** The `wasmtime::Linker` is created with nothing defined,
+so a module declaring *any* import — including WASI — fails to instantiate. This is the default
+posture, not an unfinished feature: an entry gets added when one has been argued for, and there
+is no `host_funcs.rs` until then.
+
+**Termination is bounded by fuel, not wall clock.** Fuel is deterministic — the same module on
+the same input runs out after the same instruction on every machine — which is what keeps replay
+meaningful. A wall-clock deadline would let the same log produce different outcomes on a loaded
+host. `sandbox.wall_timeout_ms` therefore has no enforcement path yet and only becomes meaningful
+once a host binding exists that can block, since fuel cannot bound time spent outside wasm.
+
+**The registry is the authorization model.** `EXECUTE_TOOL` naming a tool absent from the registry
+is rejected as `UnknownTool` before anything executes, so an empty registry denies everything.
+Modules are loaded from `<state_dir>/tools/*.{wasm,wat}` and named by file stem.
+
 ## CONFIGURATION
 
 TOML, loaded from `--config <path>`, defaults shown. Any `VANGUARD_<SECTION>_<KEY>` env var
@@ -532,7 +599,7 @@ Pinned by phase so that early phases stay buildable without the later, heavier t
 | --- | --- |
 | 0 | `rusqlite` (bundled), `hmac`, `sha2`, `getrandom`, `serde`, `serde_json`, `toml`, `thiserror`, `tracing`, `tracing-subscriber`, `clap` (derive), `tokio` (rt-multi-thread, macros, sync, signal) |
 | 1 | none beyond phase 0 — the FSM is a pure function over enums and must stay dependency-free |
-| 2 | `wasmtime` |
+| 2 | `wasmtime` (47+; see SPEC CORRECTIONS #10) |
 | 4 | `tonic`, `prost`, `tonic-build` (build-dep) |
 | 6 | `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
 | 7 | `aya`, `aya-bpf` — Linux only, behind `#[cfg(target_os = "linux")]` and an `ebpf` feature |
@@ -551,7 +618,9 @@ Each phase is done when its named test passes, not when the code looks finished.
 | 1 | `illegal_edges_rejected_without_mutation` | Every (state, event) pair outside the table leaves state unchanged and appends a `REJECTED` row |
 | 1 | `forged_runtime_origin_rejected` | `TOOL_RESULT` submitted as a proposal is rejected as `ForgedOrigin` |
 | 1 | `step_budget_halts_session` | 50 accepted steps then `HALTED`, budget not burnable by rejections |
-| 2 | `spin_loop_hits_fuel_limit` | Infinite-loop WASM module terminates under 50 ms without killing the host |
+| 2 | `spin_loop_hits_fuel_limit` | Infinite-loop WASM module terminates on fuel exhaustion, in under 50 ms |
+| 2 | `tools_cannot_reach_the_host` | A module importing WASI fails to instantiate |
+| 2 | `a_starved_tool_returns_a_result_instead_of_stranding_the_session` | A runaway tool comes back as a `TOOL_RESULT`, not a hung session |
 | 3 | `context_bounded_over_1000_turns` | Token count never exceeds 8192 across 1000 turns |
 | 4 | `vgctl_roundtrip_over_socket` | State query over the local socket matches the engine |
 | 5 | `replay_reproduces_state_sequence` | Replaying a log yields the identical state sequence and identical head hash |
@@ -567,6 +636,8 @@ build scripts. Build and test with the x64 toolchain, which runs under emulation
 ```bash
 cargo +stable-x86_64-pc-windows-msvc test --all-targets
 ```
+
+Emulation also breaks wasmtime 27's out-of-fuel unwind path outright — see SPEC CORRECTIONS #10.
 
 Unix domain sockets are unavailable in this environment for Phase 4 purposes on Windows named
 paths; the control plane binds a loopback TCP port when `cfg(windows)`, and the Unix socket path
