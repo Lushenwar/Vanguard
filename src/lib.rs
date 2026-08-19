@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod fsm;
 pub mod ledger;
+pub mod memory;
 pub mod runtime;
 pub mod sandbox;
 

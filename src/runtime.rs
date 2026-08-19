@@ -15,6 +15,7 @@ use crate::fsm::engine::{self, Decision, HaltReason, Limits, SessionView};
 use crate::fsm::state::{Event, Origin, State};
 use crate::ledger::event::{Draft, Record, Status};
 use crate::ledger::Ledger;
+use crate::memory::{self, ContextWindow};
 use crate::sandbox::{ToolError, ToolOutput, ToolRegistry};
 
 pub struct Runtime {
@@ -79,6 +80,36 @@ impl Runtime {
 
     pub fn tool_names(&self) -> &BTreeSet<String> {
         &self.tool_names
+    }
+
+    /// Assemble the bounded context window a proposer would be given.
+    ///
+    /// The budget is a parameter rather than runtime state because the caller
+    /// already holds the config, and because the same session may legitimately
+    /// be rendered at different budgets — a debugging dump and a live prompt
+    /// want different amounts of the same log.
+    pub fn context(&self, session_id: &str, max_tokens: usize) -> Result<ContextWindow> {
+        let view = self.session(session_id)?;
+        // ponytail: reads the whole session log on every call, so building a
+        // window once per turn is O(n^2) over a session. Fine to a few thousand
+        // events; past that, keep the digest incrementally on the sessions row
+        // and fetch only the tail, which is the same arithmetic the pager
+        // already does one event at a time.
+        let events = self.ledger.events(Some(session_id))?;
+        memory::build(
+            session_id,
+            view.state,
+            view.steps,
+            self.limits.max_steps,
+            &events,
+            max_tokens,
+        )
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "max_context_tokens must be at least {}",
+                memory::MIN_TOKENS
+            ))
+        })
     }
 
     /// Create a session if it does not exist. Idempotent.

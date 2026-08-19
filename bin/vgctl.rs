@@ -63,6 +63,17 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Render the bounded context window a proposer would be given.
+    Context {
+        #[arg(long)]
+        session_id: String,
+        /// Token budget. Defaults to the config's limits.max_context_tokens.
+        #[arg(long)]
+        max_tokens: Option<usize>,
+        /// Print only the accounting, not the window itself.
+        #[arg(long)]
+        stats: bool,
+    },
     /// Fold the ledger back through the FSM and report any divergence.
     Replay {
         #[arg(long)]
@@ -164,6 +175,26 @@ fn run(args: Args) -> vanguard::Result<u8> {
                     r.to_state
                 );
             }
+            Ok(code::OK)
+        }
+
+        Command::Context {
+            session_id,
+            max_tokens,
+            stats,
+        } => {
+            let budget = max_tokens.unwrap_or(config.limits.max_context_tokens as usize);
+            let ledger = open(&db_path, &config)?;
+            let rt = Runtime::new(ledger, limits, Clock::new(), tools(&config)?);
+            let window = rt.context(&session_id, budget)?;
+
+            if !stats {
+                print!("{window}");
+                println!("--");
+            }
+            println!("tokens  {}/{}", window.tokens, window.max_tokens);
+            println!("live    {} events", window.tail.len());
+            println!("evicted {} events", window.evicted());
             Ok(code::OK)
         }
 
