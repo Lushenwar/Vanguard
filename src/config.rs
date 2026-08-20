@@ -38,6 +38,7 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub sandbox: SandboxConfig,
     pub egress: EgressConfig,
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +69,42 @@ pub struct SandboxConfig {
     pub fuel: u64,
     pub max_memory_mb: u64,
     pub wall_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    pub service_name: String,
+    /// OTLP/gRPC collector, e.g. `http://127.0.0.1:4317`. Empty disables trace
+    /// export entirely rather than falling back to a default endpoint — a
+    /// collector address is not something to guess at.
+    pub otlp_endpoint: String,
+    /// Append-only JSONL audit stream. Empty disables it.
+    pub audit_log: PathBuf,
+    pub audit_interval_ms: u64,
+    pub audit_batch: usize,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        TelemetryConfig {
+            service_name: APP_NAME.to_string(),
+            otlp_endpoint: String::new(),
+            audit_log: PathBuf::new(),
+            audit_interval_ms: 1_000,
+            audit_batch: 512,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    pub fn otlp_enabled(&self) -> bool {
+        !self.otlp_endpoint.is_empty()
+    }
+
+    pub fn audit_enabled(&self) -> bool {
+        !self.audit_log.as_os_str().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

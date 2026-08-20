@@ -29,6 +29,7 @@ use vanguard::ledger::event::hex;
 use vanguard::ledger::{key, replay, Ledger};
 use vanguard::runtime::Runtime;
 use vanguard::sandbox::{Sandbox, ToolRegistry};
+use vanguard::telemetry::audit::{self, AuditSink, JsonlSink};
 
 /// Exit codes, as documented in CLAUDE.md.
 mod code {
@@ -111,6 +112,17 @@ enum Command {
         /// Print only the accounting, not the window itself.
         #[arg(long)]
         stats: bool,
+    },
+    /// Drain unexported ledger events into a JSONL audit file. Offline.
+    ///
+    /// Shares its cursor with the daemon's exporter when pointed at the same
+    /// file, so running this by hand does not re-send what has already gone.
+    Export {
+        #[arg(long, value_name = "PATH")]
+        to: PathBuf,
+        /// Events per batch.
+        #[arg(long, default_value_t = 512)]
+        batch: usize,
     },
     /// Fold the ledger back through the FSM and report any divergence.
     Replay {
@@ -376,6 +388,17 @@ async fn run(args: Args) -> vanguard::Result<u8> {
             println!("tokens  {}/{}", window.tokens, window.max_tokens);
             println!("live    {} events", window.tail.len());
             println!("evicted {} events", window.evicted());
+            Ok(code::OK)
+        }
+
+        Command::Export { to, batch } => {
+            let ledger = open(&db_path, &config)?;
+            let mut sink = JsonlSink::open(&to)?;
+            let exported = audit::export_all(&ledger, &mut sink, batch)?;
+            let cursor = ledger.export_cursor(sink.name())?;
+            println!("exported {exported} events");
+            println!("cursor   seq={cursor}");
+            println!("sink     {}", to.display());
             Ok(code::OK)
         }
 

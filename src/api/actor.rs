@@ -60,6 +60,23 @@ pub enum Command {
     Health {
         reply: oneshot::Sender<Result<HealthSnapshot>>,
     },
+    /// Read the next unexported batch for one audit sink.
+    AuditBatch {
+        sink: String,
+        batch: usize,
+        reply: oneshot::Sender<Result<Vec<Record>>>,
+    },
+    /// Record that a sink has durably consumed everything up to `seq`.
+    ///
+    /// Separate from `AuditBatch` on purpose: the sink write happens between
+    /// the two, off this thread, so a slow or fsyncing sink never stalls
+    /// proposals. It is also what keeps the cursor advance a single-writer
+    /// operation like every other write.
+    AuditAdvance {
+        sink: String,
+        seq: u64,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +200,18 @@ impl Handle {
         self.call(|reply| Command::Health { reply }).await
     }
 
+    pub async fn audit_batch(&self, sink: &str, batch: usize) -> Result<Vec<Record>> {
+        let sink = sink.to_string();
+        self.call(|reply| Command::AuditBatch { sink, batch, reply })
+            .await
+    }
+
+    pub async fn audit_advance(&self, sink: &str, seq: u64) -> Result<()> {
+        let sink = sink.to_string();
+        self.call(|reply| Command::AuditAdvance { sink, seq, reply })
+            .await
+    }
+
     async fn call<T>(&self, make: impl FnOnce(oneshot::Sender<Result<T>>) -> Command) -> Result<T> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -247,6 +276,18 @@ fn run(
 
             Command::Health { reply } => {
                 let _ = reply.send(health_snapshot(&runtime, started));
+            }
+
+            Command::AuditBatch { sink, batch, reply } => {
+                let records = runtime
+                    .ledger()
+                    .export_cursor(&sink)
+                    .and_then(|cursor| runtime.ledger().events_after(cursor, batch));
+                let _ = reply.send(records);
+            }
+
+            Command::AuditAdvance { sink, seq, reply } => {
+                let _ = reply.send(runtime.ledger().set_export_cursor(&sink, seq));
             }
         }
     }
