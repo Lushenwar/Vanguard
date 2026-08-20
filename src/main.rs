@@ -95,6 +95,31 @@ async fn run(args: Args) -> vanguard::Result<ExitCode> {
         info!("no tools registered; every EXECUTE_TOOL proposal will be rejected");
     }
 
+    // Parsed at boot so a malformed rule stops the daemon here, with the rule
+    // quoted, rather than silently denying everything at runtime.
+    let egress = config.egress_policy()?;
+    let (enforceable, unenforceable) = vanguard::egress::filter::triage(&egress);
+    info!(
+        rules = egress.entries().len(),
+        enforceable_at_socket = enforceable,
+        ebpf = vanguard::egress::filter::Filter::available(),
+        "egress policy loaded"
+    );
+    if egress.is_empty() {
+        // The safe default, and indistinguishable from a broken config unless
+        // someone says so.
+        info!("egress allowlist is empty: every destination is denied");
+    }
+    for rule in &unenforceable {
+        tracing::warn!(rule = %rule.rule, why = rule.why, "egress rule is not enforced here");
+    }
+    if !egress.is_empty() && !vanguard::egress::filter::Filter::available() {
+        tracing::warn!(
+            "no socket-layer egress filter in this build; today nothing in a tool \
+             can open a socket anyway, because the wasm linker grants no host bindings"
+        );
+    }
+
     let runtime = Runtime::new(ledger, limits, Clock::new(), tools);
     let (handle, runtime_thread) = Handle::spawn(runtime, config.limits.max_context_tokens);
 

@@ -15,7 +15,7 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 ```text
 ╔══════════════════════════════════════════════════════════╗
 ║  VANGUARD BUILD PROGRESS                       6/8 DONE  ║
-║  ██████████████████████░░░░░░  PHASES 0-4, 6 SHIPPED     ║
+║  ████████████████████████░░░░  0-4, 6 DONE; 5, 7 PARTIAL ║
 ║  Phase specs and exit tests live in this file, below.     ║
 ║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
 ║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
@@ -24,7 +24,7 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 ║  Phase 4: gRPC Control Plane & Local Socket API      [x]  ║
 ║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
 ║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [x]  ║
-║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [ ]  ║
+║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [~]  ║
 ╚══════════════════════════════════════════════════════════╝
 
 ```
@@ -47,8 +47,12 @@ cursor, so the stream cannot lose an event.
 reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
 half, which cannot exist before Phase 2 gives tools something to execute in.
 
-**Phase 7 is specified but not built**, and cannot be built or tested on this workstation: eBPF
-is Linux-only. Each has a named exit test in the
+**Phase 7 is partially built.** The egress allowlist — the policy every enforcement point
+consults — is implemented and tested: parsing, wildcard and CIDR matching, port narrowing, default
+deny, and `vgctl egress` to ask it directly. The eBPF filter that would enforce the address rules
+at the socket layer is written but **has never been compiled or loaded**: it needs Linux, and this
+workstation is Windows on ARM. It is gated behind `#[cfg(target_os = "linux")]` and an `ebpf`
+feature, and refuses loudly rather than silently no-opping anywhere else. Each has a named exit test in the
 IMPLEMENTATION CONTRACT below that defines when it is done.
 
 **Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
@@ -111,9 +115,14 @@ The engine decouples **Reasoning** (probabilistic) from **Execution** (determini
 | 2 | Infinite tool call recursion | Hard step budget ($N \le 50$) per session | Yes |
 | 3 | WASM sandbox breakout / resource exhaustion | Explicit `wasmtime` fuel limits & cgroups | Yes |
 | 4 | Memory context overflow during long loops | Context Paging Subsystem (evicts cold turns to disk) | Yes |
-| 5 | Network exfiltration via tool call | eBPF egress filtering + domain allowlists | Mostly |
+| 5 | Network exfiltration via tool call | Today: no host binding exists through which a tool could open a socket. Additionally: an egress allowlist, enforced at the host binding for names and by eBPF for addresses | Yes, for now |
 
 ---
+
+The "Yes, for now" in row 5 is worth being precise about. A wasm tool cannot reach the network
+because the linker grants it nothing — the syscall is unreachable, not merely blocked, which is a
+stronger guarantee than any filter provides. That holds only until the first host binding or
+subprocess wrapper is added, which is what the egress layers exist for.
 
 ## NON-NEGOTIABLES
 
@@ -159,6 +168,10 @@ vanguard/                          [x] exists  [ ] planned
 │   │   ├── mod.rs                 [x] tool registry = the authorization model
 │   │   ├── wasm.rs                [x] wasmtime wrapper, fuel & memory ceilings
 │   │   └── host_funcs.rs          [ ] deliberately absent; the whitelist is empty
+│   ├── egress/
+│   │   ├── mod.rs                 [x]
+│   │   ├── policy.rs              [x] the allowlist; pure, tested everywhere
+│   │   └── filter.rs              [~] eBPF loader; Linux only, never run
 │   ├── telemetry/
 │   │   ├── mod.rs                 [x] tracing + OTLP init, exporter loop
 │   │   └── audit.rs               [x] cursor-based, at-least-once export
@@ -174,6 +187,8 @@ vanguard/                          [x] exists  [ ] planned
 │       ├── client.rs              [x] dialling, per-platform transport
 │       └── proto/vanguard.proto   [x] the wire contract
 ├── build.rs                       [x] protobuf codegen
+├── bpf/                           [~] the BPF program; separate crate, never built
+│   └── src/main.rs                [~] cgroup connect4/connect6 hooks
 ├── tools/
 │   └── echo.wat                   [x] reference tool; the ABI, executable
 ├── bin/
@@ -181,6 +196,7 @@ vanguard/                          [x] exists  [ ] planned
 └── tests/
     ├── common/mod.rs              [x] shared tool fixtures
     ├── api_tests.rs               [x] Phase 4 exit tests
+    ├── egress_tests.rs            [x] Phase 7 policy tests
     ├── fsm_tests.rs               [x] Phase 1 exit tests
     ├── ledger_tests.rs            [x] Phase 0 exit tests
     ├── memory_tests.rs            [x] Phase 3 exit tests
@@ -338,6 +354,7 @@ cargo run --bin vgctl -- --config config.dev.toml context --session-id demo --ma
 cargo run --bin vgctl -- --config config.dev.toml replay
 cargo run --bin vgctl -- --config config.dev.toml verify
 cargo run --bin vgctl -- --config config.dev.toml export --to .vanguard/audit.jsonl
+cargo run --bin vgctl -- --config config.dev.toml egress --target api.example.com:443
 
 # Execute full suite of unit and integration tests
 cargo test --all-targets --all-features
@@ -412,6 +429,9 @@ disagreement is recorded under **SPEC CORRECTIONS**.
 | 16 | `unix:///var/run/vanguard.sock` as the only transport | Unix socket on Unix, loopback TCP (`runtime.control_addr`) on Windows | Tokio has no `UnixListener` on Windows. Two config keys rather than one overloaded string: a path and a socket address are different things, and a field that is sometimes one and sometimes the other is a field nobody can validate. |
 | 17 | "Full trace spans exported to local collector endpoints with **zero dropped span events** under 1,000 req/sec" | Split in two. Traces are best-effort and may be dropped by a collector's queue; the **audit stream** is cursor-based and cannot lose an event | These are two pipelines with opposite failure requirements, and the original wording collapses them. A dropped span costs you a graph; a dropped audit record costs you the ability to say what happened. What this crate can assert in-process is that instrumentation emits one span per operation at rate — `no_dropped_spans_under_load`. Whether a *remote* collector received them is a property of that collector's queue depth, and claiming otherwise would be marketing. The guarantee Vanguard actually makes about not losing events is the audit stream's, and it is stronger than the one asked for. |
 | 18 | An audit exporter would naturally buffer events and ship them | It buffers nothing. A cursor names a position in the ledger, which is already durable | Anything an exporter holds in memory is something a crash can take. With a cursor, an unacknowledged record is still on disk and gets re-read; the exporter has no state of its own to lose. |
+| 19 | "Egress traffic from WASM tools restricted strictly to explicit domain/IP allowlists at the socket level" | Split. **Address** rules are enforceable at the socket level; **domain** rules are not, and are enforced at the host binding instead | A `cgroup/connect4` hook sees a destination address. By the time `connect()` runs, the hostname has been resolved and forgotten, so `*.example.com` is unenforceable there. A filter that silently ignored it would leave an operator believing a rule is enforced when nothing is enforcing it — worse than no filter. `Filter::attach` refuses such a policy unless the caller explicitly acknowledges the split, and `vgctl egress` prints which rules are enforced where. |
+| 20 | An allowlist would normally support a wildcard | There is no allow-everything rule; `allow = ["*"]` is a parse error | The one-character difference between `allow = []` and `allow = ["*"]` is too small a gesture for a decision that large. A deployment that wants unrestricted egress should not be running an egress filter. |
+| 21 | eBPF is the defence against tool exfiltration | It is defence in depth. The primary defence is that no host binding exists | Absence of a socket-opening import is a stronger guarantee than a filter: the syscall cannot be reached rather than being blocked once attempted. Stating the filter as the primary control would overstate what is protecting the system today and understate what changes the day a host binding is added. |
 
 ## FSM: STATES
 
@@ -702,6 +722,58 @@ Consequences worth knowing:
 Output is JSONL rather than a JSON array: an array must be rewritten to be appended to, and a
 truncated array is unparseable, whereas a truncated JSONL file loses only its last line.
 
+## EGRESS CONTROL
+
+`[egress] allow` is an allowlist. Empty denies everything, and so does any destination its rules
+do not match — absence of a rule is a denial, never a wildcard.
+
+| Rule | Matches |
+| --- | --- |
+| `example.com` | exactly that name |
+| `*.example.com` | any subdomain — and **not** `example.com` itself |
+| `1.2.3.4` | that address |
+| `10.0.0.0/8`, `2001:db8::/32` | that prefix |
+| `example.com:443`, `[::1]:8443` | any of the above, narrowed to one port |
+
+Matching is case-insensitive and ignores a trailing root dot, because `EXAMPLE.COM.` and
+`example.com` are the same destination and treating them as different is a bypass. `*.example.com`
+does not match `evil-example.com`; the leading dot in the comparison is what stops it. An address
+rule never matches a name — resolving one here would make the decision depend on DNS, which
+whoever controls the record could move afterwards. IPv4 and IPv6 do not cross, so `10.0.0.0/8`
+does not admit `::ffff:10.0.0.1`.
+
+A malformed rule stops the daemon at boot, with the rule quoted. Dropping it would leave the
+config file describing an enforcement that is not happening.
+
+### Two enforcement points, because one is not enough
+
+```text
+  host binding ──▶ EgressPolicy::decide(name, port)   names and addresses
+        │
+        ▼
+   connect(2) ──▶ eBPF cgroup hook                    addresses only
+```
+
+A `connect()` hook sees an address, never a name — the hostname is resolved and forgotten long
+before. So hostname rules are enforced at the layer that still knows the name, and eBPF is defence
+in depth beneath it, checking the address a connection actually goes to rather than the one a name
+claimed to resolve to. `vgctl egress --target <host:port>` prints the verdict, the rule that
+matched, and which rules this build can enforce where.
+
+**Today neither layer is what stops a tool reaching the network.** The wasm linker is empty, so a
+tool has no binding through which a socket could be opened. These layers keep that true once one
+is added.
+
+### eBPF status: written, never run
+
+`src/egress/filter.rs` and the program in `bpf/` have never been compiled for a Linux target or
+loaded into a kernel — this workstation cannot do either. Both are gated behind
+`#[cfg(target_os = "linux")]` and the `ebpf` feature. Everywhere else `Filter::attach` returns an
+error saying nothing was attached; it never returns a no-op filter, because "falling back to
+permissive networking" is the failure mode in the risk taxonomy and a caller must never come away
+believing egress is filtered when nothing was loaded. Build instructions are in the BUILDING
+comment in `filter.rs`. Expect to fight the verifier.
+
 ## CONFIGURATION
 
 TOML, loaded from `--config <path>`, defaults shown. Any `VANGUARD_<SECTION>_<KEY>` env var
@@ -747,6 +819,7 @@ audit_batch       = 512
 | `vgctl state --session-id <id>` | Current state, step count, consecutive rejects |
 | `vgctl ledger [--session-id <id>] [--follow]` | Dump or tail events |
 | `vgctl context --session-id <id> [--max-tokens N] [--stats]` | Render the bounded window a proposer would be given |
+| `vgctl egress --target <host:port>` | Ask the allowlist about a destination, and see which layer would enforce it |
 | `vgctl export --to <path> [--batch N]` | Drain unexported events into a JSONL audit file. Offline; shares its cursor with the daemon's exporter |
 | `vgctl replay [--session-id <id>] [--live]` | Offline reconstruction; `--live` asks the daemon instead |
 | `vgctl propose --session-id <id> --event <E> [--payload <json>] [--offline]` | Manual proposal, for testing the engine without a model. `--offline` drives the ledger file directly and is the only place `--origin` may be set |
@@ -766,7 +839,7 @@ Pinned by phase so that early phases stay buildable without the later, heavier t
 | 2 | `wasmtime` (47+; see SPEC CORRECTIONS #10) |
 | 4 | `tonic`, `tonic-prost`, `prost`, `tokio-stream`; `tonic-prost-build` and `protoc-bin-vendored` (build-deps); `hyper-util` and `tower` on Unix only, for the client's socket connector |
 | 6 | `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp` (grpc-tonic), `tracing-opentelemetry`. The audit exporter needs none of them — it is the ledger plus a cursor |
-| 7 | `aya`, `aya-bpf` — Linux only, behind `#[cfg(target_os = "linux")]` and an `ebpf` feature |
+| 7 | `aya` — Linux only, optional, behind the `ebpf` feature. `aya-ebpf` belongs to the separate `bpf/` crate, which has its own toolchain and target and is excluded from this package. The policy itself needs nothing beyond std |
 
 `src/fsm/` must not gain a dependency. It is the component whose correctness everything else
 rests on, and it is testable in microseconds precisely because it touches nothing.
@@ -797,7 +870,11 @@ Each phase is done when its named test passes, not when the code looks finished.
 | 6 | `audit_export_is_lossless_across_restarts` | Export half, restart, export the rest: gapless and no duplicates |
 | 6 | `a_down_sink_backs_up_rather_than_skipping` | A failed write leaves the cursor alone; the batch is still there on recovery |
 | 6 | `the_exported_stream_matches_the_ledger` | Every event, rejections included, with its chain hash |
-| 7 | `egress_blocked_outside_allowlist` | Linux only; skipped elsewhere |
+| 7 | `config_rules_reach_the_policy` | Config to allowlist to verdict, end to end |
+| 7 | `hostname_rules_are_reported_as_unenforceable_at_the_socket_layer` | The split is surfaced, not hidden |
+| 7 | `attaching_never_silently_succeeds_where_it_cannot_work` | No permissive fallback anywhere |
+| 7 | `a_malformed_rule_stops_the_config_rather_than_being_dropped` | A typo fails loudly |
+| 7 | `egress_blocked_outside_allowlist` | **Not written.** Needs Linux, a kernel and a cgroup |
 
 ## PLATFORM NOTE (this workstation)
 

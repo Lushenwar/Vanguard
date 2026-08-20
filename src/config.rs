@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::egress::EgressPolicy;
 use crate::error::{Error, Result};
 use crate::fsm::engine::Limits;
 use crate::sandbox::Fuel;
@@ -200,6 +201,15 @@ impl Config {
         {
             Endpoint::Tcp(self.runtime.control_addr.clone())
         }
+    }
+
+    /// Parse `[egress] allow` into a policy.
+    ///
+    /// Fails on a malformed rule rather than dropping it: a rule the runtime
+    /// silently ignored would leave the config file describing an enforcement
+    /// that is not happening.
+    pub fn egress_policy(&self) -> Result<EgressPolicy> {
+        EgressPolicy::parse(&self.egress.allow)
     }
 
     /// The subset of configuration the FSM evaluator is allowed to see.

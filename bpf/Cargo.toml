@@ -1,0 +1,25 @@
+# Its own workspace: this crate is built for bpfel-unknown-none with a nightly
+# toolchain and bpf-linker, none of which an ordinary `cargo build` of Vanguard
+# should be dragged into. See BUILDING in src/egress/filter.rs.
+[workspace]
+
+[package]
+name = "vanguard-egress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[[bin]]
+name = "vanguard-egress"
+path = "src/main.rs"
+
+[profile.release]
+# Required by the verifier: it rejects programs it cannot prove terminate, and
+# debug assertions and overflow checks generate branches it will not accept.
+debug = 2
+lto = true
+opt-level = 3
+overflow-checks = false
+panic = "abort"
