@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS events_by_session ON events(session_id, seq);
+
+-- How far each audit sink has been exported. One row per sink, so two sinks
+-- consuming at different speeds do not interfere.
+CREATE TABLE IF NOT EXISTS export_cursor (
+    sink    TEXT PRIMARY KEY,
+    seq     INTEGER NOT NULL
+);
 "#;
 
 const SELECT_EVENT: &str = "SELECT seq, session_id, mono_ns, wall_ms, from_state, event, origin, \
@@ -219,6 +226,46 @@ impl Ledger {
             }
         };
         raws.into_iter().map(decode_row).collect()
+    }
+
+    /// How far `sink` has been exported. Zero when it has never run, which is
+    /// the same state as a brand new sink — so a sink added later replays the
+    /// whole ledger rather than starting blind at the head.
+    pub fn export_cursor(&self, sink: &str) -> Result<u64> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM export_cursor WHERE sink = ?1",
+                params![sink],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    /// Record that `sink` has durably consumed everything up to `seq`.
+    ///
+    /// Only ever moves forward. A rewind would silently re-export, and worse,
+    /// a rewind caused by a bug would look identical to normal operation.
+    pub fn set_export_cursor(&self, sink: &str, seq: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO export_cursor (sink, seq) VALUES (?1, ?2) \
+             ON CONFLICT(sink) DO UPDATE SET seq = max(seq, excluded.seq)",
+            params![sink, seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Up to `limit` events with `seq > after`, oldest first.
+    pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<Record>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_EVENT} WHERE seq > ?1 ORDER BY seq LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![after as i64, limit as i64], raw_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(decode_row)
+            .collect()
     }
 
     /// Recompute the whole chain from genesis.

@@ -17,6 +17,7 @@ use vanguard::fsm::engine::Limits;
 use vanguard::ledger::{key, Ledger};
 use vanguard::runtime::Runtime;
 use vanguard::sandbox::{Sandbox, ToolRegistry};
+use vanguard::telemetry::{self, audit::JsonlSink};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,7 +47,10 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> vanguard::Result<ExitCode> {
     let config = Config::load(args.config.as_deref())?;
-    init_tracing(&config.runtime.log_level);
+    // Held for the whole process: dropping it flushes buffered spans, and
+    // dropping it early would silently stop trace export while everything still
+    // looked like it was working.
+    let _telemetry = telemetry::init(&config.runtime.log_level, &config.telemetry)?;
 
     let key = key::load_or_create(&config.runtime.state_dir)?;
     let ledger_path = config.ledger_path();
@@ -94,6 +98,25 @@ async fn run(args: Args) -> vanguard::Result<ExitCode> {
     let runtime = Runtime::new(ledger, limits, Clock::new(), tools);
     let (handle, runtime_thread) = Handle::spawn(runtime, config.limits.max_context_tokens);
 
+    // The audit exporter runs alongside the server rather than inside it: it
+    // must keep draining while requests are in flight, and it must get a final
+    // drain after they stop.
+    let (audit_stop, audit_rx) = tokio::sync::mpsc::channel(1);
+    let audit_task = if config.telemetry.audit_enabled() {
+        let sink = JsonlSink::open(&config.telemetry.audit_log)?;
+        info!(path = %sink.path().display(), "audit export enabled");
+        Some(tokio::spawn(telemetry::run_exporter(
+            handle.clone(),
+            Box::new(sink),
+            std::time::Duration::from_millis(config.telemetry.audit_interval_ms),
+            config.telemetry.audit_batch,
+            audit_rx,
+        )))
+    } else {
+        info!("audit export disabled; set telemetry.audit_log to turn it on");
+        None
+    };
+
     // Bind before announcing: "ready" should mean the socket is accepting, not
     // that we are about to try.
     let listener = server::bind(&config.control_endpoint()).await?;
@@ -111,19 +134,21 @@ async fn run(args: Args) -> vanguard::Result<ExitCode> {
     })
     .await;
 
+    // Stop and drain the exporter before the runtime goes away — it reads
+    // through the same handle, so the order is load-bearing. Without the final
+    // drain, a clean shutdown would leave the last interval's events unexported
+    // and an operator could not tell that from a crash.
+    if let Some(task) = audit_task {
+        let _ = audit_stop.send(()).await;
+        let _ = task.await;
+    }
+
     // Dropping every handle closes the command channel, which is what tells the
     // runtime thread to finish. Joining before exit means an in-flight commit
     // completes rather than dying with the process.
+    drop(audit_stop);
     drop(handle);
     let _ = runtime_thread.join();
 
     result.map(|()| ExitCode::SUCCESS)
-}
-
-fn init_tracing(level: &str) {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }

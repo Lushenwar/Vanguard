@@ -14,5 +14,6 @@ pub mod ledger;
 pub mod memory;
 pub mod runtime;
 pub mod sandbox;
+pub mod telemetry;
 
 pub use error::{Error, Result};

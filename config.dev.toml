@@ -21,3 +21,12 @@ wall_timeout_ms = 50
 
 [egress]
 allow = []
+
+[telemetry]
+service_name  = "vanguard"
+# Empty disables OTLP export. Point at a collector to turn it on, e.g.
+# otlp_endpoint = "http://127.0.0.1:4317"
+otlp_endpoint = ""
+audit_log         = "./.vanguard/audit.jsonl"
+audit_interval_ms = 1000
+audit_batch       = 512

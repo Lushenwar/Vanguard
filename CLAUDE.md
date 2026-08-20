@@ -14,8 +14,8 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 
 ```text
 ╔══════════════════════════════════════════════════════════╗
-║  VANGUARD BUILD PROGRESS                       5/8 DONE  ║
-║  ██████████████████░░░░░░░░░░  PHASES 0-4 SHIPPED        ║
+║  VANGUARD BUILD PROGRESS                       6/8 DONE  ║
+║  ██████████████████████░░░░░░  PHASES 0-4, 6 SHIPPED     ║
 ║  Phase specs and exit tests live in this file, below.     ║
 ║  Phase 0: Runtime Core, Event Log & Signed Ledger    [x]  ║
 ║  Phase 1: Deterministic FSM Engine & Guardrails      [x]  ║
@@ -23,15 +23,15 @@ A pre-commit hook (`.git/hooks/pre-commit`) enforces this locally by rejecting c
 ║  Phase 3: Context Paging & Memory Eviction Subsystem [x]  ║
 ║  Phase 4: gRPC Control Plane & Local Socket API      [x]  ║
 ║  Phase 5: Time-Travel Replay & Mock Execution Engine [~]  ║
-║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [ ]  ║
+║  Phase 6: OpenTelemetry Tracing & Audit Log Exporter [x]  ║
 ║  Phase 7: eBPF Network Proxy & Tool Rate Limiter     [ ]  ║
 ╚══════════════════════════════════════════════════════════╝
 
 ```
 
-Phase: five of eight phases completed. `[~]` means partially built.
+Phase: six of eight phases completed. `[~]` means partially built.
 
-**Phases 0 through 4 are implemented and tested.** The daemon boots, initialises a WAL-mode
+**Phases 0 through 4 and Phase 6 are implemented and tested.** The daemon boots, initialises a WAL-mode
 SQLite ledger, verifies its HMAC chain, and refuses to serve on a break. The FSM evaluates
 proposals against a fixed edge table with origin enforcement and step/rejection budgets,
 appending every decision — accepted *and* rejected — to the chain before any state change is
@@ -40,13 +40,15 @@ host bindings whatsoever, and its result comes back as a runtime-origin `TOOL_RE
 pager assembles a proposer context window that stays inside a fixed token budget however long
 the session runs, replacing evicted turns with a computed digest rather than a summary. A gRPC
 control plane exposes all of it over a local socket, with the runtime owned by a single thread
-behind a channel.
+behind a channel. Every operation emits a span, and the ledger is exported to an audit sink by
+cursor, so the stream cannot lose an event.
 
 **Phase 5 is partially built.** `vgctl replay` folds a ledger back through the engine offline and
 reports any divergence in state, status, or head hash. What is missing is the mock *tool* execution
 half, which cannot exist before Phase 2 gives tools something to execute in.
 
-**Phases 6 and 7 are specified but not built.** Each has a named exit test in the
+**Phase 7 is specified but not built**, and cannot be built or tested on this workstation: eBPF
+is Linux-only. Each has a named exit test in the
 IMPLEMENTATION CONTRACT below that defines when it is done.
 
 **Checks:** `cargo test --all-targets --all-features && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
@@ -157,6 +159,9 @@ vanguard/                          [x] exists  [ ] planned
 │   │   ├── mod.rs                 [x] tool registry = the authorization model
 │   │   ├── wasm.rs                [x] wasmtime wrapper, fuel & memory ceilings
 │   │   └── host_funcs.rs          [ ] deliberately absent; the whitelist is empty
+│   ├── telemetry/
+│   │   ├── mod.rs                 [x] tracing + OTLP init, exporter loop
+│   │   └── audit.rs               [x] cursor-based, at-least-once export
 │   ├── memory/
 │   │   ├── mod.rs                 [x]
 │   │   ├── pager.rs               [x] bounded window + computed digest
@@ -180,6 +185,7 @@ vanguard/                          [x] exists  [ ] planned
     ├── ledger_tests.rs            [x] Phase 0 exit tests
     ├── memory_tests.rs            [x] Phase 3 exit tests
     ├── sandbox_tests.rs           [x] Phase 2 exit tests
+    ├── telemetry_tests.rs         [x] Phase 6 exit tests
     └── replay_tests.rs            [x] replay fidelity tests
 
 ```
@@ -331,6 +337,7 @@ cargo run --bin vgctl -- --config config.dev.toml ledger --session-id demo
 cargo run --bin vgctl -- --config config.dev.toml context --session-id demo --max-tokens 200
 cargo run --bin vgctl -- --config config.dev.toml replay
 cargo run --bin vgctl -- --config config.dev.toml verify
+cargo run --bin vgctl -- --config config.dev.toml export --to .vanguard/audit.jsonl
 
 # Execute full suite of unit and integration tests
 cargo test --all-targets --all-features
@@ -403,6 +410,8 @@ disagreement is recorded under **SPEC CORRECTIONS**.
 | 14 | `ProposalRequest` would naturally carry an origin field | There is no origin field. Everything arriving over the control plane is `PROPOSER`, by construction | The FSM's origin check compares the *claimed* origin against the event's required one. If a caller could claim `RUNTIME`, submitting `TOOL_RESULT` with `origin = RUNTIME` would pass that check and let a model fabricate a tool result it never ran — turning the check into a formality any caller could satisfy by asserting the right string. Origin is a property of the transport. A caller naming a runtime-only event is recorded as a `PROPOSER` attempt rejected for `ForgedOrigin`: the attempt is evidence, and it could never have succeeded. |
 | 15 | Single writer via "an `mpsc` channel" (Phase 0 determinism rules) | Now literally true. The runtime lives on a dedicated OS thread behind `tokio::sync::mpsc`; Phase 0 satisfied the rule by ownership alone | Phase 0 marked this as deferred because there was exactly one `Runtime` and no concurrent producers, so a channel would have been ceremony. A server that accepts concurrent requests is what made it necessary. It is an OS thread rather than a Tokio task because wasm execution is synchronous and would otherwise block an executor worker for a whole fuel budget. |
 | 16 | `unix:///var/run/vanguard.sock` as the only transport | Unix socket on Unix, loopback TCP (`runtime.control_addr`) on Windows | Tokio has no `UnixListener` on Windows. Two config keys rather than one overloaded string: a path and a socket address are different things, and a field that is sometimes one and sometimes the other is a field nobody can validate. |
+| 17 | "Full trace spans exported to local collector endpoints with **zero dropped span events** under 1,000 req/sec" | Split in two. Traces are best-effort and may be dropped by a collector's queue; the **audit stream** is cursor-based and cannot lose an event | These are two pipelines with opposite failure requirements, and the original wording collapses them. A dropped span costs you a graph; a dropped audit record costs you the ability to say what happened. What this crate can assert in-process is that instrumentation emits one span per operation at rate — `no_dropped_spans_under_load`. Whether a *remote* collector received them is a property of that collector's queue depth, and claiming otherwise would be marketing. The guarantee Vanguard actually makes about not losing events is the audit stream's, and it is stronger than the one asked for. |
+| 18 | An audit exporter would naturally buffer events and ship them | It buffers nothing. A cursor names a position in the ledger, which is already durable | Anything an exporter holds in memory is something a crash can take. With a cursor, an unacknowledged record is still on disk and gets re-read; the exporter has no state of its own to lose. |
 
 ## FSM: STATES
 
@@ -651,6 +660,48 @@ Per-entry payloads are capped at a quarter of the budget, so one oversized tool 
 consume the window and evict every other turn. Truncation happens on a char boundary and reports
 the bytes dropped.
 
+## TELEMETRY AND AUDIT EXPORT
+
+Two pipelines that look alike and must not be treated alike.
+
+**Traces are best-effort.** `vanguard.submit` and `vanguard.tool` spans carry the session, event,
+decision, rejection reason, resulting seq and state, tool name and fuel burned. They go to stderr
+always, and to an OTLP collector when `telemetry.otlp_endpoint` is set. A batch exporter with a
+bounded queue can drop them under load; for observability that is the right trade.
+
+**The audit stream is not best-effort.** It is the ledger itself, exported by cursor:
+
+```text
+read from cursor  ─▶  write to sink  ─▶  advance cursor
+                       (fsync first)      (only on Ok)
+```
+
+The order is the design. A sink write and a cursor advance touch two different systems — a file
+and SQLite — so they cannot commit atomically without machinery that would buy nothing here. That
+leaves two choices: advance first and lose records to a crash in between, or write first and
+re-send after one. For an audit stream only the second is defensible, so delivery is
+**at-least-once**. A duplicate is detectable — every record carries a globally unique, monotonic
+`seq`, so a consumer dedupes with one comparison. A missing record is undetectable by definition,
+which is exactly the property an audit log exists to deny.
+
+Consequences worth knowing:
+
+* **Nothing is buffered.** The cursor names a position in a durable ledger, so the exporter holds
+  no state a crash could take.
+* **A failed sink backs the stream up, it does not skip.** The cursor only advances on a
+  successful, fsynced write.
+* **A new sink replays everything.** Cursors are per sink name and start at zero, so a sink added
+  later sees the history it exists to record rather than starting blind at the head.
+* **The cursor key is the canonical path**, not the path as spelled. `./x/audit.jsonl` and
+  `x/audit.jsonl` are one file; keying on the spelling gave them separate cursors and duplicated
+  the whole stream. Found by running it, fixed, and pinned by
+  `two_spellings_of_one_path_share_a_cursor`.
+* **Records carry their hash.** A downstream consumer can re-verify chain continuity without
+  access to this machine's ledger file.
+
+Output is JSONL rather than a JSON array: an array must be rewritten to be appended to, and a
+truncated array is unparseable, whereas a truncated JSONL file loses only its last line.
+
 ## CONFIGURATION
 
 TOML, loaded from `--config <path>`, defaults shown. Any `VANGUARD_<SECTION>_<KEY>` env var
@@ -677,6 +728,13 @@ wall_timeout_ms = 50
 
 [egress]
 allow = []                              # empty = deny all
+
+[telemetry]
+service_name      = "vanguard"
+otlp_endpoint     = ""                  # empty = trace export disabled
+audit_log         = ""                  # empty = audit export disabled
+audit_interval_ms = 1000
+audit_batch       = 512
 ```
 
 ## CLI SURFACE (`vgctl`)
@@ -689,6 +747,7 @@ allow = []                              # empty = deny all
 | `vgctl state --session-id <id>` | Current state, step count, consecutive rejects |
 | `vgctl ledger [--session-id <id>] [--follow]` | Dump or tail events |
 | `vgctl context --session-id <id> [--max-tokens N] [--stats]` | Render the bounded window a proposer would be given |
+| `vgctl export --to <path> [--batch N]` | Drain unexported events into a JSONL audit file. Offline; shares its cursor with the daemon's exporter |
 | `vgctl replay [--session-id <id>] [--live]` | Offline reconstruction; `--live` asks the daemon instead |
 | `vgctl propose --session-id <id> --event <E> [--payload <json>] [--offline]` | Manual proposal, for testing the engine without a model. `--offline` drives the ledger file directly and is the only place `--origin` may be set |
 
@@ -706,7 +765,7 @@ Pinned by phase so that early phases stay buildable without the later, heavier t
 | 3 | none beyond phase 0 — the pager reads the ledger and counts; see SPEC CORRECTIONS #11 |
 | 2 | `wasmtime` (47+; see SPEC CORRECTIONS #10) |
 | 4 | `tonic`, `tonic-prost`, `prost`, `tokio-stream`; `tonic-prost-build` and `protoc-bin-vendored` (build-deps); `hyper-util` and `tower` on Unix only, for the client's socket connector |
-| 6 | `opentelemetry`, `opentelemetry-otlp`, `tracing-opentelemetry` |
+| 6 | `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp` (grpc-tonic), `tracing-opentelemetry`. The audit exporter needs none of them — it is the ledger plus a cursor |
 | 7 | `aya`, `aya-bpf` — Linux only, behind `#[cfg(target_os = "linux")]` and an `ebpf` feature |
 
 `src/fsm/` must not gain a dependency. It is the component whose correctness everything else
@@ -734,7 +793,10 @@ Each phase is done when its named test passes, not when the code looks finished.
 | 4 | `the_control_plane_cannot_bypass_a_budget` | The step budget halts a network-driven session |
 | 4 | `a_cancelled_request_does_not_disturb_the_runtime` | An abandoned request still commits; the chain stays intact |
 | 5 | `replay_reproduces_state_sequence` | Replaying a log yields the identical state sequence and identical head hash |
-| 6 | `no_dropped_spans_under_load` | 1000 req/sec, zero dropped spans |
+| 6 | `no_dropped_spans_under_load` | 1000 req/sec sustained, one span emitted per operation, none missing |
+| 6 | `audit_export_is_lossless_across_restarts` | Export half, restart, export the rest: gapless and no duplicates |
+| 6 | `a_down_sink_backs_up_rather_than_skipping` | A failed write leaves the cursor alone; the batch is still there on recovery |
+| 6 | `the_exported_stream_matches_the_ledger` | Every event, rejections included, with its chain hash |
 | 7 | `egress_blocked_outside_allowlist` | Linux only; skipped elsewhere |
 
 ## PLATFORM NOTE (this workstation)

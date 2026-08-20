@@ -139,6 +139,22 @@ impl Runtime {
     /// An unknown session is an `Err`, not a `REJECTED` row: a ledger event has
     /// to hang off a session, so there is nowhere to write the rejection. See
     /// SPEC CORRECTIONS #6 in CLAUDE.md.
+    #[tracing::instrument(
+        name = "vanguard.submit",
+        skip_all,
+        fields(
+            session_id = %session_id,
+            event = %event,
+            origin = %submitted_origin,
+            payload_bytes = payload.len(),
+            // Filled in once the FSM has ruled; recording them up front would
+            // mean guessing at the answer this span exists to report.
+            seq = tracing::field::Empty,
+            decision = tracing::field::Empty,
+            reject_reason = tracing::field::Empty,
+            to_state = tracing::field::Empty,
+        )
+    )]
     pub fn submit(
         &mut self,
         session_id: &str,
@@ -167,6 +183,17 @@ impl Runtime {
             decision,
             after,
         )?;
+
+        let span = tracing::Span::current();
+        span.record("seq", record.seq);
+        span.record("to_state", record.to_state.as_str());
+        match decision {
+            Decision::Accept { .. } => span.record("decision", "ACCEPTED"),
+            Decision::Reject { reason } => {
+                span.record("decision", "REJECTED");
+                span.record("reject_reason", reason.as_str())
+            }
+        };
 
         // Budgets are checked against the post-commit state, so the ABORT is
         // always ordered after the event that exhausted the budget. An operator
@@ -205,6 +232,17 @@ impl Runtime {
 
     /// Execute the tool an accepted `EXECUTE_TOOL` named, then feed the result
     /// back as a runtime-origin `TOOL_RESULT`.
+    #[tracing::instrument(
+        name = "vanguard.tool",
+        skip_all,
+        fields(
+            session_id = %session_id,
+            tool_name = tracing::field::Empty,
+            ok = tracing::field::Empty,
+            fuel_used = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    )]
     fn dispatch(&mut self, session_id: &str, payload: &[u8]) -> Result<ToolRun> {
         // `evaluate` already established that the payload names a registered
         // tool; re-deriving the name from the same bytes with the same function
@@ -212,7 +250,21 @@ impl Runtime {
         let tool_name = engine::tool_name(payload)
             .expect("evaluator accepted an EXECUTE_TOOL without a tool_name");
 
+        let span = tracing::Span::current();
+        span.record("tool_name", tool_name.as_str());
+
         let output = self.tools.call(&tool_name, payload);
+        match &output {
+            Ok(o) => {
+                span.record("ok", true);
+                span.record("fuel_used", o.fuel_used);
+            }
+            Err(e) => {
+                span.record("ok", false);
+                span.record("error", e.to_string());
+            }
+        }
+
         let result_payload = match &output {
             Ok(o) => tool_result_payload(&o.bytes),
             Err(e) => tool_error_payload(&e.to_string()),
