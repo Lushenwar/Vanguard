@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.90"
 
+# The BPF program is its own crate with its own toolchain and target; an
+# ordinary build must not try to compile it for the host.
+exclude = ["bpf"]
+
+[features]
+# eBPF egress enforcement. Linux only -- see src/egress/filter.rs. Enabling it
+# elsewhere is harmless: the dependency is target-gated and the code is behind
+# cfg(target_os = "linux"), so `--all-features` still builds on Windows.
+ebpf = ["dep:aya"]
+
 [lib]
 name = "vanguard"
 path = "src/lib.rs"
@@ -50,6 +60,9 @@ tonic-prost-build = "0.14.6"
 # Client-side Unix socket support. tonic's channel needs a custom connector for
 # a non-TCP transport, which pulls in the hyper/tower plumbing; on Windows the
 # control plane is loopback TCP and none of this is needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"

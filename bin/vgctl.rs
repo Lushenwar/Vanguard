@@ -22,6 +22,7 @@ use vanguard::api::pb::{
 use vanguard::api::{self, Client};
 use vanguard::clock::Clock;
 use vanguard::config::Config;
+use vanguard::egress::filter::{self, Filter};
 use vanguard::error::Error;
 use vanguard::fsm::engine::Decision;
 use vanguard::fsm::state::{Event, Origin};
@@ -112,6 +113,18 @@ enum Command {
         /// Print only the accounting, not the window itself.
         #[arg(long)]
         stats: bool,
+    },
+    /// Ask the egress policy whether a destination is permitted. Offline.
+    ///
+    /// The policy is pure, so this answers exactly what an enforcement point
+    /// would answer -- no daemon and no network involved.
+    Egress {
+        /// `host`, `host:port`, `1.2.3.4:443`, or `[::1]:443`.
+        #[arg(long)]
+        target: String,
+        /// Port to assume when the target does not carry one.
+        #[arg(long, default_value_t = 443)]
+        port: u16,
     },
     /// Drain unexported ledger events into a JSONL audit file. Offline.
     ///
@@ -391,6 +404,37 @@ async fn run(args: Args) -> vanguard::Result<u8> {
             Ok(code::OK)
         }
 
+        Command::Egress { target, port } => {
+            let policy = config.egress_policy()?;
+            let (host, port) = split_target(&target, port);
+            let verdict = policy.decide(&host, port);
+
+            println!("target  {host}:{port}");
+            println!("rules   {}", policy.entries().len());
+            println!("verdict {verdict}");
+
+            // Say plainly whether anything is actually enforcing this, so a
+            // permitted verdict is never mistaken for an enforced one.
+            let (enforceable, skipped) = filter::triage(&policy);
+            println!(
+                "filter  {} ({enforceable} address rule(s) enforceable at the socket layer)",
+                if Filter::available() {
+                    "eBPF available"
+                } else {
+                    "eBPF unavailable in this build"
+                }
+            );
+            for s in &skipped {
+                println!("        {} — {}", s.rule, s.why);
+            }
+
+            Ok(if verdict.is_allowed() {
+                code::OK
+            } else {
+                code::REJECTED
+            })
+        }
+
         Command::Export { to, batch } => {
             let ledger = open(&db_path, &config)?;
             let mut sink = JsonlSink::open(&to)?;
@@ -494,6 +538,25 @@ fn tools(config: &Config) -> vanguard::Result<ToolRegistry> {
     let mut registry = ToolRegistry::new(sandbox);
     registry.load_dir(&config.tools_dir())?;
     Ok(registry)
+}
+
+/// Split a `host:port` target, honouring bracketed IPv6.
+fn split_target(target: &str, default_port: u16) -> (String, u16) {
+    if let Some(rest) = target.strip_prefix('[') {
+        if let Some((addr, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(default_port);
+            return (addr.to_string(), port);
+        }
+    }
+    // More than one colon and no brackets is a bare IPv6 literal, not a port.
+    match target.rsplit_once(':') {
+        Some(_) if target.matches(':').count() > 1 => (target.to_string(), default_port),
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(default_port)),
+        None => (target.to_string(), default_port),
+    }
 }
 
 fn micros(nanos: u64) -> String {

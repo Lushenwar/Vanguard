@@ -8,6 +8,7 @@
 pub mod api;
 pub mod clock;
 pub mod config;
+pub mod egress;
 pub mod error;
 pub mod fsm;
 pub mod ledger;
